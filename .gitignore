@@ -30,3 +30,9 @@ Thumbs.db
 
 # Debug files
 *.pdb 
+
+# original JS ported from
+quic.js
+
+#example usage
+examples/

@@ -15,6 +15,13 @@ pub fn build(b: *std.Build) void {
     // Install the library
     b.installArtifact(quic_lib);
 
+    // Create a module for easy consumption by other projects
+    _ = b.addModule("quic", .{
+        .root_source_file = b.path("src/quic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Create a test executable for development and testing
     const test_exe = b.addExecutable(.{
         .name = "quic-test",
