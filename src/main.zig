@@ -177,6 +177,7 @@ pub fn main() !void {
         .{ .name = "10x10 Blue RGB32", .hex_data = "5155494300000000040000000a0000000a000000e0818080ffffff3bfffebffffecffff7bffff7ff00ecfffd00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 255 }, .should_be_solid = true },
         .{ .name = "10x10 Black RGB32", .hex_data = "5155494300000000040000000a0000000a000000ff808080fffffffff7fffebffffecffffdbffff70000ecff00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 0 }, .should_be_solid = true },
         .{ .name = "10x10 RGB Pattern", .hex_data = "5155494300000000040000000a0000000a0000008280808111e409722f97bc6472c9cb2597bc5cf2c9cb252fbc5cf272cb252f975cf272c9252f97bcf272c9cb2f97bc5c72c9cb2597bc5cf2c9cb252fbc5cf272cb252f975cf272c9252f97bcf272c9cb00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 0 }, .should_be_solid = false },
+        .{ .name = "10x10 White RGB24 (test)", .hex_data = "5155494300000000030000000a0000000a00000080818181ffab8080bffffffffff7fffef7fffecffffdbfff000000ec00000000", .expected_rgb = .{ .r = 255, .g = 255, .b = 255 }, .should_be_solid = true },
     };
 
     for (test_cases) |test_case| {
@@ -216,7 +217,13 @@ fn testQuicData(allocator: Allocator, name: []const u8, hex_data: []const u8, ex
         return;
     }
 
-    std.debug.print("  ✅ Header parsed: Type {} (RGB32), Size: {}x{}\n", .{ decoder.image_type, decoder.width, decoder.height });
+    const format_name = switch (decoder.image_type) {
+        quic.Constants.QUIC_IMAGE_TYPE_RGB32 => "RGB32",
+        quic.Constants.QUIC_IMAGE_TYPE_RGB24 => "RGB24",
+        quic.Constants.QUIC_IMAGE_TYPE_RGBA => "RGBA",
+        else => "Other",
+    };
+    std.debug.print("  ✅ Header parsed: Type {} ({s}), Size: {}x{}\n", .{ decoder.image_type, format_name, decoder.width, decoder.height });
 
     // Try to decode
     const decode_result = decoder.simpleQuicDecode(allocator) catch |err| {
@@ -228,39 +235,80 @@ fn testQuicData(allocator: Allocator, name: []const u8, hex_data: []const u8, ex
         defer allocator.free(decoded_data);
         std.debug.print("  ✅ Decode completed! Buffer size: {} bytes\n", .{decoded_data.len});
 
-        if (decoded_data.len >= 4) {
-            const r = decoded_data[2]; // Red is at offset 2
-            const g = decoded_data[1]; // Green is at offset 1
-            const b = decoded_data[0]; // Blue is at offset 0
-            std.debug.print("  First pixel (RGB): ({},{},{})\n", .{ r, g, b });
+        if (decoder.image_type == quic.Constants.QUIC_IMAGE_TYPE_RGB24) {
+            // RGB24 handling (3 bytes per pixel)
+            if (decoded_data.len >= 3) {
+                const r = decoded_data[2]; // Red is at offset 2
+                const g = decoded_data[1]; // Green is at offset 1
+                const b = decoded_data[0]; // Blue is at offset 0
+                std.debug.print("  First pixel (RGB): ({},{},{})\n", .{ r, g, b });
 
-            // Check if the first pixel matches expected color
-            if (should_be_solid) {
-                if (r == expected_rgb.r and g == expected_rgb.g and b == expected_rgb.b) {
-                    std.debug.print("  ✅ EXPECTED COLOR DECODED CORRECTLY!\n", .{});
+                // Check if the first pixel matches expected color
+                if (should_be_solid) {
+                    if (r == expected_rgb.r and g == expected_rgb.g and b == expected_rgb.b) {
+                        std.debug.print("  ✅ EXPECTED COLOR DECODED CORRECTLY!\n", .{});
+                    } else {
+                        std.debug.print("  ❌ Expected ({},{},{}) but got ({},{},{})\n", .{ expected_rgb.r, expected_rgb.g, expected_rgb.b, r, g, b });
+                    }
+
+                    // Check if all pixels are the same (solid color test)
+                    const first_pixel = decoded_data[0..3];
+                    var all_same = true;
+                    for (1..decoded_data.len / 3) |pixel| {
+                        const pixel_data = decoded_data[pixel * 3 .. pixel * 3 + 3];
+                        if (!std.mem.eql(u8, first_pixel, pixel_data)) {
+                            all_same = false;
+                            break;
+                        }
+                    }
+                    std.debug.print("  Solid color check: {s}\n", .{if (all_same) "✅ PASS (all pixels identical)" else "❌ FAIL (pixels differ)"});
                 } else {
-                    std.debug.print("  ❌ Expected ({},{},{}) but got ({},{},{})\n", .{ expected_rgb.r, expected_rgb.g, expected_rgb.b, r, g, b });
-                }
-
-                // Check if all pixels are the same (solid color test)
-                const first_pixel = decoded_data[0..4];
-                var all_same = true;
-                for (1..decoded_data.len / 4) |pixel| {
-                    const pixel_data = decoded_data[pixel * 4 .. pixel * 4 + 4];
-                    if (!std.mem.eql(u8, first_pixel, pixel_data)) {
-                        all_same = false;
-                        break;
+                    std.debug.print("  Pattern image - showing first 4 pixels:\n", .{});
+                    for (0..@min(4, decoded_data.len / 3)) |pixel| {
+                        const idx = pixel * 3;
+                        const pixel_r = decoded_data[idx + 2];
+                        const pixel_g = decoded_data[idx + 1];
+                        const pixel_b = decoded_data[idx + 0];
+                        std.debug.print("    Pixel {}: ({},{},{})\n", .{ pixel, pixel_r, pixel_g, pixel_b });
                     }
                 }
-                std.debug.print("  Solid color check: {s}\n", .{if (all_same) "✅ PASS (all pixels identical)" else "❌ FAIL (pixels differ)"});
-            } else {
-                std.debug.print("  Pattern image - showing first 4 pixels:\n", .{});
-                for (0..@min(4, decoded_data.len / 4)) |pixel| {
-                    const idx = pixel * 4;
-                    const pixel_r = decoded_data[idx + 2];
-                    const pixel_g = decoded_data[idx + 1];
-                    const pixel_b = decoded_data[idx + 0];
-                    std.debug.print("    Pixel {}: ({},{},{})\n", .{ pixel, pixel_r, pixel_g, pixel_b });
+            }
+        } else {
+            // RGB32/RGBA handling (4 bytes per pixel)
+            if (decoded_data.len >= 4) {
+                const r = decoded_data[2]; // Red is at offset 2
+                const g = decoded_data[1]; // Green is at offset 1
+                const b = decoded_data[0]; // Blue is at offset 0
+                std.debug.print("  First pixel (RGB): ({},{},{})\n", .{ r, g, b });
+
+                // Check if the first pixel matches expected color
+                if (should_be_solid) {
+                    if (r == expected_rgb.r and g == expected_rgb.g and b == expected_rgb.b) {
+                        std.debug.print("  ✅ EXPECTED COLOR DECODED CORRECTLY!\n", .{});
+                    } else {
+                        std.debug.print("  ❌ Expected ({},{},{}) but got ({},{},{})\n", .{ expected_rgb.r, expected_rgb.g, expected_rgb.b, r, g, b });
+                    }
+
+                    // Check if all pixels are the same (solid color test)
+                    const first_pixel = decoded_data[0..4];
+                    var all_same = true;
+                    for (1..decoded_data.len / 4) |pixel| {
+                        const pixel_data = decoded_data[pixel * 4 .. pixel * 4 + 4];
+                        if (!std.mem.eql(u8, first_pixel, pixel_data)) {
+                            all_same = false;
+                            break;
+                        }
+                    }
+                    std.debug.print("  Solid color check: {s}\n", .{if (all_same) "✅ PASS (all pixels identical)" else "❌ FAIL (pixels differ)"});
+                } else {
+                    std.debug.print("  Pattern image - showing first 4 pixels:\n", .{});
+                    for (0..@min(4, decoded_data.len / 4)) |pixel| {
+                        const idx = pixel * 4;
+                        const pixel_r = decoded_data[idx + 2];
+                        const pixel_g = decoded_data[idx + 1];
+                        const pixel_b = decoded_data[idx + 0];
+                        std.debug.print("    Pixel {}: ({},{},{})\n", .{ pixel, pixel_r, pixel_g, pixel_b });
+                    }
                 }
             }
         }
