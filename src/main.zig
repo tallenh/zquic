@@ -177,6 +177,7 @@ pub fn main() !void {
         .{ .name = "10x10 Blue RGB32", .hex_data = "5155494300000000040000000a0000000a000000e0818080ffffff3bfffebffffecffff7bffff7ff00ecfffd00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 255 }, .should_be_solid = true },
         .{ .name = "10x10 Black RGB32", .hex_data = "5155494300000000040000000a0000000a000000ff808080fffffffff7fffebffffecffffdbffff70000ecff00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 0 }, .should_be_solid = true },
         .{ .name = "10x10 RGB Pattern", .hex_data = "5155494300000000040000000a0000000a0000008280808111e409722f97bc6472c9cb2597bc5cf2c9cb252fbc5cf272cb252f975cf272c9252f97bcf272c9cb2f97bc5c72c9cb2597bc5cf2c9cb252fbc5cf272cb252f975cf272c9252f97bcf272c9cb00000000", .expected_rgb = .{ .r = 0, .g = 0, .b = 0 }, .should_be_solid = false },
+        .{ .name = "10x10 Custom RGB32", .hex_data = "5155494300000000040000000a0000000a00000080bd7ab2018180802108080262841102efffff31fffdbffffdbffff37fffefff000000fb00000000", .expected_rgb = .{ .r = 25, .g = 125, .b = 225 }, .should_be_solid = true },
         .{ .name = "10x10 White RGB24 (test)", .hex_data = "5155494300000000030000000a0000000a00000080818181ffab8080bffffffffff7fffef7fffecffffdbfff000000ec00000000", .expected_rgb = .{ .r = 255, .g = 255, .b = 255 }, .should_be_solid = true },
     };
 
@@ -301,13 +302,51 @@ fn testQuicData(allocator: Allocator, name: []const u8, hex_data: []const u8, ex
                     }
                     std.debug.print("  Solid color check: {s}\n", .{if (all_same) "✅ PASS (all pixels identical)" else "❌ FAIL (pixels differ)"});
                 } else {
-                    std.debug.print("  Pattern image - showing first 4 pixels:\n", .{});
-                    for (0..@min(4, decoded_data.len / 4)) |pixel| {
+                    // Validate RGB pattern: Red, Green, Blue, Red, Green, Blue...
+                    std.debug.print("  Pattern validation - Expected: Red→Green→Blue→Red...\n", .{});
+                    var pattern_correct = true;
+                    var error_count: u32 = 0;
+
+                    for (0..decoded_data.len / 4) |pixel| {
                         const idx = pixel * 4;
                         const pixel_r = decoded_data[idx + 2];
                         const pixel_g = decoded_data[idx + 1];
                         const pixel_b = decoded_data[idx + 0];
-                        std.debug.print("    Pixel {}: ({},{},{})\n", .{ pixel, pixel_r, pixel_g, pixel_b });
+
+                        // Expected pattern based on pixel position within each row
+                        // For 10x10 image: row = pixel / 10, col = pixel % 10
+                        const col = pixel % 10;
+                        const pattern_pos = col % 3; // Pattern repeats every 3 pixels within each row
+
+                        const expected_color = switch (pattern_pos) {
+                            0 => "Red(255,0,0)", // Red pixel
+                            1 => "Green(0,255,0)", // Green pixel
+                            2 => "Blue(0,0,255)", // Blue pixel
+                            else => unreachable,
+                        };
+
+                        const is_correct = switch (pattern_pos) {
+                            0 => (pixel_r == 255 and pixel_g == 0 and pixel_b == 0), // Red
+                            1 => (pixel_r == 0 and pixel_g == 255 and pixel_b == 0), // Green
+                            2 => (pixel_r == 0 and pixel_g == 0 and pixel_b == 255), // Blue
+                            else => unreachable,
+                        };
+
+                        if (!is_correct) {
+                            pattern_correct = false;
+                            error_count += 1;
+                            if (error_count <= 3) { // Show first 3 errors
+                                std.debug.print("    ❌ Pixel {}: Expected {s}, got ({},{},{})\n", .{ pixel, expected_color, pixel_r, pixel_g, pixel_b });
+                            }
+                        } else if (pixel < 6) { // Show first 6 correct pixels
+                            std.debug.print("    ✅ Pixel {}: {s} = ({},{},{})\n", .{ pixel, expected_color, pixel_r, pixel_g, pixel_b });
+                        }
+                    }
+
+                    if (pattern_correct) {
+                        std.debug.print("  ✅ RGB PATTERN VALIDATION PASSED! All 100 pixels follow Red→Green→Blue sequence\n", .{});
+                    } else {
+                        std.debug.print("  ❌ RGB PATTERN VALIDATION FAILED! {} incorrect pixels found\n", .{error_count});
                     }
                 }
             }
