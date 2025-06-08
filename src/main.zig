@@ -1,52 +1,125 @@
 const std = @import("std");
-const quic = @import("quic");
+const quic = @import("quic.zig");
 
 pub fn main() !void {
-    // Initialize the library
-    try quic.init();
-
-    std.debug.print("QUIC library initialized successfully!\n", .{});
-    std.debug.print("Supported image types:\n", .{});
-    std.debug.print("  - GRAY (BPC: {})\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_GRAY)});
-    std.debug.print("  - RGB16 (BPC: {})\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB16)});
-    std.debug.print("  - RGB24 (BPC: {})\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB24)});
-    std.debug.print("  - RGB32 (BPC: {})\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB32)});
-    std.debug.print("  - RGBA (BPC: {})\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGBA)});
-
-    // Test some basic functions
-    std.debug.print("\nTesting ceilLog2 function:\n", .{});
-    std.debug.print("  ceilLog2(1) = {}\n", .{quic.ceilLog2(1)});
-    std.debug.print("  ceilLog2(2) = {}\n", .{quic.ceilLog2(2)});
-    std.debug.print("  ceilLog2(8) = {}\n", .{quic.ceilLog2(8)});
-    std.debug.print("  ceilLog2(16) = {}\n", .{quic.ceilLog2(16)});
-
-    std.debug.print("\nTesting cntLZeroes function:\n", .{});
-    std.debug.print("  cntLZeroes(0x01) = {}\n", .{quic.cntLZeroes(0x01)});
-    std.debug.print("  cntLZeroes(0x80) = {}\n", .{quic.cntLZeroes(0x80)});
-    std.debug.print("  cntLZeroes(0xFF) = {}\n", .{quic.cntLZeroes(0xFF)});
-
-    // Test Golomb functions
-    std.debug.print("\nTesting Golomb functions:\n", .{});
-    const golomb_result = quic.golombDecoding8bpc(2, 0x80000000);
-    std.debug.print("  golombDecoding8bpc(2, 0x80000000) = {{ .codewordlen = {}, .rc = {} }}\n", .{ golomb_result.codewordlen, golomb_result.rc });
-
-    const code_len = quic.golombCodeLen8bpc(10, 3);
-    std.debug.print("  golombCodeLen8bpc(10, 3) = {}\n", .{code_len});
-
-    // Test encoder creation
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var encoder = quic.QuicEncoder.init(allocator) catch |err| {
-        std.debug.print("Failed to create encoder: {}\n", .{err});
+    std.debug.print("QUIC Library Test Program\n", .{});
+    std.debug.print("========================\n\n", .{});
+
+    // Initialize the library
+    try quic.init();
+
+    // Test image type BPC values
+    std.debug.print("Image type BPC values:\n", .{});
+    std.debug.print("  GRAY: {}\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_GRAY)});
+    std.debug.print("  RGB16: {}\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB16)});
+    std.debug.print("  RGB24: {}\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB24)});
+    std.debug.print("  RGB32: {}\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGB32)});
+    std.debug.print("  RGBA: {}\n", .{quic.quicImageBpc(quic.Constants.QUIC_IMAGE_TYPE_RGBA)});
+    std.debug.print("\n", .{});
+
+    // Test helper functions
+    std.debug.print("Helper function tests:\n", .{});
+    std.debug.print("  ceilLog2(1): {}\n", .{quic.ceilLog2(1)});
+    std.debug.print("  ceilLog2(255): {}\n", .{quic.ceilLog2(255)});
+    std.debug.print("  ceilLog2(256): {}\n", .{quic.ceilLog2(256)});
+    std.debug.print("  cntLZeroes(0x80): {}\n", .{quic.cntLZeroes(0x80)});
+    std.debug.print("  cntLZeroes(0x0F): {}\n", .{quic.cntLZeroes(0x0F)});
+    std.debug.print("\n", .{});
+
+    // Test Golomb functions
+    std.debug.print("Golomb function tests:\n", .{});
+    const golomb_result = quic.golombDecoding8bpc(3, 0x12345678);
+    std.debug.print("  golombDecoding8bpc(3, 0x12345678): codewordlen={}, rc={}\n", .{ golomb_result.codewordlen, golomb_result.rc });
+    std.debug.print("  golombCodeLen8bpc(42, 3): {}\n", .{quic.golombCodeLen8bpc(42, 3)});
+    std.debug.print("\n", .{});
+
+    // Test QuicEncoder creation
+    std.debug.print("Creating QuicEncoder...\n", .{});
+    var encoder = try quic.QuicEncoder.init(allocator);
+    defer encoder.deinit();
+    encoder.initChannelPointers();
+
+    std.debug.print("Model levels - 8bpc: {}, 5bpc: {}\n", .{ encoder.model_8bpc.levels, encoder.model_5bpc.levels });
+    std.debug.print("Model buckets - 8bpc: {}, 5bpc: {}\n", .{ encoder.model_8bpc.n_buckets, encoder.model_5bpc.n_buckets });
+    std.debug.print("\n", .{});
+
+    // Test I/O and header parsing functions
+    std.debug.print("Testing I/O and header parsing:\n", .{});
+
+    // Create a sample QUIC header (RGB24, 100x75 image)
+    // Magic: QUIC (0x43495551), Version: 0x00000000, Type: RGB24 (3), Width: 100, Height: 75
+    const sample_header = [_]u8{
+        0x51, 0x55, 0x49, 0x43, // Magic: "QUIC" (little-endian)
+        0x00, 0x00, 0x00, 0x00, // Version: 0
+        0x03, 0x00, 0x00, 0x00, // Type: RGB24 (3)
+        0x64, 0x00, 0x00, 0x00, // Width: 100
+        0x4B, 0x00, 0x00, 0x00, // Height: 75
+        // Additional dummy data to prevent out-of-bounds reads
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+
+    const parse_result = encoder.quicDecodeBegin(&sample_header) catch |err| {
+        std.debug.print("  Error parsing header: {}\n", .{err});
         return;
     };
-    defer encoder.deinit();
 
-    std.debug.print("\nQuicEncoder created successfully!\n", .{});
-    std.debug.print("  Model 8bpc levels: {}\n", .{encoder.model_8bpc.levels});
-    std.debug.print("  Model 5bpc levels: {}\n", .{encoder.model_5bpc.levels});
+    if (parse_result) {
+        std.debug.print("  Successfully parsed QUIC header!\n", .{});
+        std.debug.print("  Image type: {}\n", .{encoder.image_type});
+        std.debug.print("  Image type name: {s}\n", .{switch (encoder.image_type) {
+            quic.Constants.QUIC_IMAGE_TYPE_GRAY => "GRAY",
+            quic.Constants.QUIC_IMAGE_TYPE_RGB16 => "RGB16",
+            quic.Constants.QUIC_IMAGE_TYPE_RGB24 => "RGB24",
+            quic.Constants.QUIC_IMAGE_TYPE_RGB32 => "RGB32",
+            quic.Constants.QUIC_IMAGE_TYPE_RGBA => "RGBA",
+            else => "UNKNOWN",
+        }});
+        std.debug.print("  Width: {}\n", .{encoder.width});
+        std.debug.print("  Height: {}\n", .{encoder.height});
+        std.debug.print("  BPC: {}\n", .{quic.quicImageBpc(encoder.image_type)});
+    } else {
+        std.debug.print("  Failed to parse QUIC header\n", .{});
+    }
+    std.debug.print("\n", .{});
 
-    std.debug.print("\nQUIC library port with core structures complete!\n", .{});
+    // Test with invalid magic number
+    std.debug.print("Testing with invalid magic number:\n", .{});
+    const invalid_header = [_]u8{
+        0xFF, 0xFF, 0xFF, 0xFF, // Invalid magic
+        0x00, 0x00, 0x00, 0x00, // Version: 0
+        0x03, 0x00, 0x00, 0x00, // Type: RGB24 (3)
+        0x64, 0x00, 0x00, 0x00, // Width: 100
+        0x4B, 0x00, 0x00, 0x00, // Height: 75
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+
+    const invalid_result = encoder.quicDecodeBegin(&invalid_header) catch false;
+
+    if (!invalid_result) {
+        std.debug.print("  Correctly rejected invalid header\n", .{});
+    } else {
+        std.debug.print("  ERROR: Should have rejected invalid header!\n", .{});
+    }
+    std.debug.print("\n", .{});
+
+    // Test with too short data
+    std.debug.print("Testing with insufficient data:\n", .{});
+    const short_data = [_]u8{ 0x51, 0x55, 0x49 }; // Only 3 bytes
+
+    const short_result = encoder.quicDecodeBegin(&short_data) catch false;
+
+    if (!short_result) {
+        std.debug.print("  Correctly handled insufficient data\n", .{});
+    }
+    std.debug.print("\n", .{});
+
+    std.debug.print("All tests completed!\n", .{});
+    std.debug.print("\nNOTE: We can now parse QUIC headers and validate the format!\n", .{});
+    std.debug.print("      Next steps would be implementing the decompression algorithms.\n", .{});
 }

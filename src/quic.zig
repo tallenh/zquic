@@ -522,8 +522,12 @@ const QuicFamilyStat = struct {
 
             self.buckets_buf.items[bnumber] = QuicBucket.init();
 
-            for (bstart..bend + 1) |i| {
-                self.buckets_ptrs.items[i] = &self.buckets_buf.items[bnumber];
+            // Ensure we don't go out of bounds
+            const end_idx = @min(bend + 1, model.levels);
+            for (bstart..end_idx) |i| {
+                if (i < model.levels) {
+                    self.buckets_ptrs.items[i] = &self.buckets_buf.items[bnumber];
+                }
             }
 
             bnumber += 1;
@@ -581,14 +585,30 @@ const QuicChannel = struct {
     }
 
     fn reste(self: *QuicChannel, bpc: u32) !bool {
-        self.state.reste();
+        // Reset correlate row
+        self.correlate_row.zero = 0;
+        self.correlate_row.row.clearAndFree();
 
         if (bpc == 8) {
             _ = try self.family_stat_8bpc.fillModelStructures(self.model_8bpc);
-        } else {
+            // Reset buckets for 8bpc
+            for (self.family_stat_8bpc.buckets_buf.items) |*bucket| {
+                bucket.reste(7);
+            }
+            // Note: buckets_ptrs assignment would need to be properly handled
+        } else if (bpc == 5) {
             _ = try self.family_stat_5bpc.fillModelStructures(self.model_5bpc);
+            // Reset buckets for 5bpc
+            for (self.family_stat_5bpc.buckets_buf.items) |*bucket| {
+                bucket.reste(4);
+            }
+            // Note: buckets_ptrs assignment would need to be properly handled
+        } else {
+            std.debug.print("quic: bad bpc {}\n", .{bpc});
+            return false;
         }
 
+        self.state.reste();
         return true;
     }
 };
@@ -634,17 +654,138 @@ pub const QuicEncoder = struct {
             .rows_completed = 0,
         };
 
-        // Initialize channels
+        // Initialize channels with null pointers first
         for (0..4) |i| {
-            encoder.channels[i] = QuicChannel.init(allocator, &encoder.model_8bpc, &encoder.model_5bpc);
+            encoder.channels[i] = QuicChannel.init(allocator, undefined, undefined);
         }
 
         return encoder;
+    }
+
+    pub fn initChannelPointers(self: *QuicEncoder) void {
+        // Fix the model pointers after the encoder is fully constructed
+        for (0..4) |i| {
+            self.channels[i].model_8bpc = &self.model_8bpc;
+            self.channels[i].model_5bpc = &self.model_5bpc;
+        }
     }
 
     pub fn deinit(self: *QuicEncoder) void {
         for (0..4) |i| {
             self.channels[i].deinit();
         }
+    }
+
+    // I/O functions (from JavaScript)
+
+    /// Reset encoder state with new byte stream
+    pub fn reste(self: *QuicEncoder, io_ptr: []const u8) bool {
+        self.rgb_state.reste();
+
+        self.io_now = io_ptr;
+        self.io_end = @intCast(io_ptr.len);
+        self.io_idx = 0;
+        self.rows_completed = 0;
+        return true;
+    }
+
+    /// Read a 32-bit word from the byte stream (little-endian)
+    pub fn readIoWord(self: *QuicEncoder) !void {
+        if (self.io_idx + 4 > self.io_end) {
+            return error.OutOfData;
+        }
+
+        self.io_next_word = @as(u32, self.io_now[self.io_idx]) |
+            (@as(u32, self.io_now[self.io_idx + 1]) << 8) |
+            (@as(u32, self.io_now[self.io_idx + 2]) << 16) |
+            (@as(u32, self.io_now[self.io_idx + 3]) << 24);
+        self.io_idx += 4;
+    }
+
+    /// Consume specified number of bits from the bit stream
+    pub fn decodeEatbits(self: *QuicEncoder, len: u32) !void {
+        self.io_word <<= @intCast(len);
+
+        const delta_signed = @as(i32, @intCast(self.io_available_bits)) - @as(i32, @intCast(len));
+        if (delta_signed >= 0) {
+            const delta: u32 = @intCast(delta_signed);
+            self.io_available_bits = delta;
+            self.io_word |= self.io_next_word >> @intCast(self.io_available_bits);
+        } else {
+            const delta: u32 = @intCast(-delta_signed);
+            self.io_word |= self.io_next_word << @intCast(delta);
+            try self.readIoWord();
+            self.io_available_bits = 32 - delta;
+            self.io_word |= self.io_next_word >> @intCast(self.io_available_bits);
+        }
+    }
+
+    /// Consume 32 bits from the bit stream
+    pub fn decodeEat32bits(self: *QuicEncoder) !void {
+        try self.decodeEatbits(16);
+        try self.decodeEatbits(16);
+    }
+
+    /// Reset all channels for specified bits per component
+    pub fn resteChannels(self: *QuicEncoder, bpc: u32) !bool {
+        for (0..4) |i| {
+            if (!(try self.channels[i].reste(bpc))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Parse QUIC header and validate format
+    pub fn quicDecodeBegin(self: *QuicEncoder, io_ptr: []const u8) !bool {
+        if (!self.reste(io_ptr)) {
+            return false;
+        }
+
+        self.io_idx = 0;
+        try self.readIoWord();
+        self.io_word = self.io_next_word;
+        self.io_available_bits = 0;
+
+        // Check magic number (QUIC = 0x43495551)
+        const magic = self.io_word;
+        try self.decodeEat32bits();
+        if (magic != 0x43495551) {
+            std.debug.print("quic: bad magic 0x{X}\n", .{magic});
+            return false;
+        }
+
+        // Check version (0x00000000)
+        const version = self.io_word;
+        try self.decodeEat32bits();
+        if (version != 0x00000000) {
+            std.debug.print("quic: bad version 0x{X}\n", .{version});
+            return false;
+        }
+
+        // Read image type
+        self.image_type = self.io_word;
+        try self.decodeEat32bits();
+
+        // Read width
+        self.width = self.io_word;
+        try self.decodeEat32bits();
+
+        // Read height
+        self.height = self.io_word;
+        try self.decodeEat32bits();
+
+        // Get bits per component and reset channels
+        const bpc = quicImageBpc(self.image_type);
+        if (bpc == 0) {
+            std.debug.print("quic: invalid image type {}\n", .{self.image_type});
+            return false;
+        }
+
+        if (!(try self.resteChannels(bpc))) {
+            return false;
+        }
+
+        return true;
     }
 };
