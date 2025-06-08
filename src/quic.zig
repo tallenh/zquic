@@ -795,6 +795,40 @@ pub const QuicEncoder = struct {
         return true;
     }
 
+    /// Initialize decoder for raw compressed data without header
+    /// Caller must provide image type, width, and height that would normally be in the header
+    pub fn quicDecodeBeginHeaderless(self: *QuicEncoder, raw_data: []const u8, image_type: u32, width: u32, height: u32) !bool {
+        // Validate image type first
+        const bpc = quicImageBpc(image_type);
+        if (bpc == 0) {
+            std.debug.print("quic: invalid image type {}\n", .{image_type});
+            return false;
+        }
+
+        // Reset encoder state with raw compressed data (no header parsing)
+        if (!self.reste(raw_data)) {
+            return false;
+        }
+
+        // Set image parameters provided by caller
+        self.image_type = image_type;
+        self.width = width;
+        self.height = height;
+
+        // Initialize I/O state for reading compressed data
+        self.io_idx = 0;
+        try self.readIoWord();
+        self.io_word = self.io_next_word;
+        self.io_available_bits = 0;
+
+        // Reset channels for the specified bits per component
+        if (!(try self.resteChannels(bpc))) {
+            return false;
+        }
+
+        return true;
+    }
+
     // Row decompression functions (from JavaScript)
 
     /// Decode run length for RLE compression

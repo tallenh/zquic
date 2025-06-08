@@ -62,8 +62,8 @@ pub fn main() !void {
     // Initialize channel model pointers (required after construction)
     decoder.initChannelPointers();
 
-    // Parse QUIC header from your data
-    const quic_data: []const u8 = /* your QUIC data */;
+    // Option 1: Parse QUIC header from complete data
+    const quic_data: []const u8 = /* your QUIC data with header */;
     const parse_success = try decoder.quicDecodeBegin(quic_data);
 
     if (parse_success) {
@@ -77,6 +77,23 @@ pub fn main() !void {
                 decoder.height,
                 decoded_pixels.len
             });
+        }
+    }
+
+    // Option 2: Decode raw compressed data without header
+    const raw_compressed_data: []const u8 = /* your raw QUIC compressed data */;
+    const headerless_success = try decoder.quicDecodeBeginHeaderless(
+        raw_compressed_data,
+        4,    // image_type (e.g., 4 = RGB32)
+        1920, // width
+        1080  // height
+    );
+
+    if (headerless_success) {
+        // Decode the image (same as above)
+        if (try decoder.simpleQuicDecode(allocator)) |decoded_pixels| {
+            defer allocator.free(decoded_pixels);
+            // Use your decoded pixels...
         }
     }
 }
@@ -109,6 +126,7 @@ exe.root_module.addImport("quic", quic_lib.root_module);
 - `QuicEncoder.init(allocator)` - Create a new decoder instance
 - `decoder.initChannelPointers()` - Initialize channel model pointers (required after init)
 - `decoder.quicDecodeBegin(data)` - Parse QUIC header and validate format
+- `decoder.quicDecodeBeginHeaderless(raw_data, image_type, width, height)` - Decode raw data without header
 - `decoder.simpleQuicDecode(allocator)` - Decode the image data
 
 ### Supported Formats
