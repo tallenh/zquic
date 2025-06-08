@@ -34,5 +34,8 @@ Thumbs.db
 # original JS ported from
 quic.js
 
+# C test code
+*.c
+
 #example usage
 examples/

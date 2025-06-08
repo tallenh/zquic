@@ -1,0 +1,22 @@
+.{
+    .name = .zquic,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0x947d823d592cc12f,
+    .paths = .{
+        "src",
+        "examples",
+        "LICENSE",
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        // Test data files for validation
+        "encoded_10x10_custom_rgb32.hex",
+        "encoded_10x10_white_rgb32.hex",
+        "encoded_10x10_rgb_pattern.hex",
+        "encoded_10x10_red_rgb32.hex",
+        "encoded_10x10_green_rgb32.hex",
+        "encoded_10x10_blue_rgb32.hex",
+        "encoded_10x10_black_rgb32.hex",
+    },
+}
