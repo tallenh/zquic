@@ -5,7 +5,6 @@
     .fingerprint = 0x947d823d592cc12f,
     .paths = .{
         "src",
-        "examples",
         "LICENSE",
         "README.md",
         "build.zig",
