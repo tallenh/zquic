@@ -25,5 +25,28 @@ pub fn main() !void {
     std.debug.print("  cntLZeroes(0x80) = {}\n", .{quic.cntLZeroes(0x80)});
     std.debug.print("  cntLZeroes(0xFF) = {}\n", .{quic.cntLZeroes(0xFF)});
 
-    std.debug.print("\nQUIC library port is ready for further development!\n", .{});
+    // Test Golomb functions
+    std.debug.print("\nTesting Golomb functions:\n", .{});
+    const golomb_result = quic.golombDecoding8bpc(2, 0x80000000);
+    std.debug.print("  golombDecoding8bpc(2, 0x80000000) = {{ .codewordlen = {}, .rc = {} }}\n", .{ golomb_result.codewordlen, golomb_result.rc });
+
+    const code_len = quic.golombCodeLen8bpc(10, 3);
+    std.debug.print("  golombCodeLen8bpc(10, 3) = {}\n", .{code_len});
+
+    // Test encoder creation
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var encoder = quic.QuicEncoder.init(allocator) catch |err| {
+        std.debug.print("Failed to create encoder: {}\n", .{err});
+        return;
+    };
+    defer encoder.deinit();
+
+    std.debug.print("\nQuicEncoder created successfully!\n", .{});
+    std.debug.print("  Model 8bpc levels: {}\n", .{encoder.model_8bpc.levels});
+    std.debug.print("  Model 5bpc levels: {}\n", .{encoder.model_5bpc.levels});
+
+    std.debug.print("\nQUIC library port with core structures complete!\n", .{});
 }

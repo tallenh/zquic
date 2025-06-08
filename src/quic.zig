@@ -200,8 +200,6 @@ pub fn cntLZeroes(bits: u8) u8 {
     return L_ZEROES[bits];
 }
 
-// TODO: Add more structures and functions for QuicModel, QuicBucket, etc.
-
 /// Initialize the QUIC library
 pub fn init() !void {
     if (!need_init) return;
@@ -252,3 +250,401 @@ test "init" {
     // Basic sanity check that initialization completed
     try testing.expect(!need_init);
 }
+
+// Golomb coding result structure
+const GolombResult = struct {
+    codewordlen: u32,
+    rc: u32,
+};
+
+/// Golomb decoding for 8 bits per component
+pub fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
+    var rc: u32 = undefined;
+    var cwlen: u32 = undefined;
+
+    if (bits > family_8bpc.not_gr_prefix_mask[l]) {
+        const zeroprefix = cntLZeroes(@as(u8, @truncate(bits >> 24)));
+        cwlen = zeroprefix + 1 + l;
+        rc = (@as(u32, zeroprefix) << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
+    } else {
+        cwlen = family_8bpc.not_gr_cwlen[l];
+        rc = family_8bpc.n_gr_codewords[l] + ((bits >> @intCast(32 - cwlen)) & BPP_MASK[family_8bpc.not_gr_suffix_len[l]]);
+    }
+
+    return GolombResult{ .codewordlen = cwlen, .rc = rc };
+}
+
+/// Calculate Golomb code length for 8 bits per component
+pub fn golombCodeLen8bpc(n: u32, l: u32) u32 {
+    if (n < family_8bpc.n_gr_codewords[l]) {
+        return (n >> @intCast(l)) + 1 + l;
+    } else {
+        return family_8bpc.not_gr_cwlen[l];
+    }
+}
+
+// Forward declarations for cross-references
+const CommonState = struct {
+    waitcnt: u32,
+    tabrand_seed: u8,
+    wm_trigger: u32,
+    wmidx: u32,
+    wmileft: u32,
+    melcstate: u32,
+    melclen: u32,
+    melcorder: u32,
+
+    fn init() CommonState {
+        var state = CommonState{
+            .waitcnt = 0,
+            .tabrand_seed = 0xff,
+            .wm_trigger = 0,
+            .wmidx = 0,
+            .wmileft = DEF_WMI_NEXT,
+            .melcstate = 0,
+            .melclen = 0,
+            .melcorder = 0,
+        };
+        state.setWmTrigger();
+        return state;
+    }
+
+    fn setWmTrigger(self: *CommonState) void {
+        var wm = self.wmidx;
+        if (wm > 10) {
+            wm = 10;
+        }
+
+        const evol_idx = DEF_EVOL / 2;
+        self.wm_trigger = BEST_TRIG_TAB[evol_idx][wm];
+    }
+
+    fn reste(self: *CommonState) void {
+        self.waitcnt = 0;
+        self.tabrand_seed = 0xff;
+        self.wmidx = 0;
+        self.wmileft = DEF_WMI_NEXT;
+
+        self.setWmTrigger();
+
+        self.melcstate = 0;
+        self.melclen = J[0];
+        self.melcorder = @as(u32, 1) << @intCast(self.melclen);
+    }
+
+    fn tabrand(self: *CommonState) u32 {
+        self.tabrand_seed = self.tabrand_seed +% 1;
+        return TABRAND_CHAOS[self.tabrand_seed];
+    }
+};
+
+// Model structure for QUIC encoding/decoding
+const QuicModel = struct {
+    levels: u32,
+    n_buckets_ptrs: u32,
+    n_buckets: u32,
+    repfirst: u32,
+    firstsize: u32,
+    repnext: u32,
+    mulsize: u32,
+
+    fn init(bpc: u32) QuicModel {
+        var model = QuicModel{
+            .levels = @as(u32, 1) << @intCast(bpc),
+            .n_buckets_ptrs = 0,
+            .n_buckets = 0,
+            .repfirst = 0,
+            .firstsize = 0,
+            .repnext = 0,
+            .mulsize = 0,
+        };
+
+        // Set parameters based on evol value (using DEF_EVOL = 3)
+        const evol_val = DEF_EVOL;
+        switch (evol_val) {
+            1 => {
+                model.repfirst = 3;
+                model.firstsize = 1;
+                model.repnext = 2;
+                model.mulsize = 2;
+            },
+            3 => {
+                model.repfirst = 1;
+                model.firstsize = 1;
+                model.repnext = 1;
+                model.mulsize = 2;
+            },
+            5 => {
+                model.repfirst = 1;
+                model.firstsize = 1;
+                model.repnext = 1;
+                model.mulsize = 4;
+            },
+            else => {
+                // Default case for other evol values
+                model.repfirst = 1;
+                model.firstsize = 1;
+                model.repnext = 1;
+                model.mulsize = 2;
+            },
+        }
+
+        // Calculate bucket structure
+        var bend: u32 = 0;
+        var repcntr = model.repfirst + 1;
+        var bsize = model.firstsize;
+
+        while (true) {
+            var bstart: u32 = undefined;
+            if (model.n_buckets != 0) {
+                bstart = bend + 1;
+            } else {
+                bstart = 0;
+            }
+
+            repcntr -= 1;
+            if (repcntr == 0) {
+                repcntr = model.repnext;
+                bsize *= model.mulsize;
+            }
+
+            bend = bstart + bsize - 1;
+            if (bend + bsize >= model.levels) {
+                bend = model.levels - 1;
+            }
+
+            if (model.n_buckets_ptrs == 0) {
+                model.n_buckets_ptrs = model.levels;
+            }
+
+            model.n_buckets += 1;
+
+            if (bend >= model.levels - 1) break;
+        }
+
+        return model;
+    }
+};
+
+// Bucket structure for model buckets
+const QuicBucket = struct {
+    counters: [8]u32,
+    bestcode: u32,
+
+    fn init() QuicBucket {
+        return QuicBucket{
+            .counters = [8]u32{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .bestcode = 0,
+        };
+    }
+
+    fn reste(self: *QuicBucket, bpp: u32) void {
+        self.bestcode = bpp;
+        self.counters = [8]u32{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    }
+
+    fn updateModel8bpc(self: *QuicBucket, state: *CommonState, curval: u32, bpp: u32) void {
+        var bestcode = bpp - 1;
+        self.counters[bestcode] += golombCodeLen8bpc(curval, bestcode);
+        var bestcodelen = self.counters[bestcode];
+
+        var i: i32 = @as(i32, @intCast(bpp)) - 2;
+        while (i >= 0) : (i -= 1) {
+            const idx = @as(u32, @intCast(i));
+            self.counters[idx] += golombCodeLen8bpc(curval, idx);
+            const ithcodelen = self.counters[idx];
+
+            if (ithcodelen < bestcodelen) {
+                bestcode = idx;
+                bestcodelen = ithcodelen;
+            }
+        }
+
+        self.bestcode = bestcode;
+
+        if (bestcodelen > state.wm_trigger) {
+            for (0..bpp) |j| {
+                self.counters[j] = self.counters[j] >> 1;
+            }
+        }
+    }
+};
+
+// Family statistics structure
+const QuicFamilyStat = struct {
+    buckets_ptrs: std.ArrayList(?*QuicBucket),
+    buckets_buf: std.ArrayList(QuicBucket),
+
+    fn init(allocator: Allocator) QuicFamilyStat {
+        return QuicFamilyStat{
+            .buckets_ptrs = std.ArrayList(?*QuicBucket).init(allocator),
+            .buckets_buf = std.ArrayList(QuicBucket).init(allocator),
+        };
+    }
+
+    fn deinit(self: *QuicFamilyStat) void {
+        self.buckets_ptrs.deinit();
+        self.buckets_buf.deinit();
+    }
+
+    fn fillModelStructures(self: *QuicFamilyStat, model: *const QuicModel) !bool {
+        try self.buckets_ptrs.resize(model.levels);
+        try self.buckets_buf.resize(model.n_buckets);
+
+        // Initialize all pointers to null first
+        for (0..model.levels) |i| {
+            self.buckets_ptrs.items[i] = null;
+        }
+
+        var bend: u32 = 0;
+        var bnumber: u32 = 0;
+        var repcntr = model.repfirst + 1;
+        var bsize = model.firstsize;
+
+        while (true) {
+            var bstart: u32 = undefined;
+            if (bnumber != 0) {
+                bstart = bend + 1;
+            } else {
+                bstart = 0;
+            }
+
+            repcntr -= 1;
+            if (repcntr == 0) {
+                repcntr = model.repnext;
+                bsize *= model.mulsize;
+            }
+
+            bend = bstart + bsize - 1;
+            if (bend + bsize >= model.levels) {
+                bend = model.levels - 1;
+            }
+
+            self.buckets_buf.items[bnumber] = QuicBucket.init();
+
+            for (bstart..bend + 1) |i| {
+                self.buckets_ptrs.items[i] = &self.buckets_buf.items[bnumber];
+            }
+
+            bnumber += 1;
+
+            if (bend >= model.levels - 1) break;
+        }
+
+        return true;
+    }
+};
+
+// Correlate row structure
+const CorrelateRow = struct {
+    zero: u32,
+    row: std.ArrayList(u32),
+
+    fn init(allocator: Allocator) CorrelateRow {
+        return CorrelateRow{
+            .zero = 0,
+            .row = std.ArrayList(u32).init(allocator),
+        };
+    }
+
+    fn deinit(self: *CorrelateRow) void {
+        self.row.deinit();
+    }
+};
+
+// Channel structure
+const QuicChannel = struct {
+    state: CommonState,
+    family_stat_8bpc: QuicFamilyStat,
+    family_stat_5bpc: QuicFamilyStat,
+    correlate_row: CorrelateRow,
+    model_8bpc: *const QuicModel,
+    model_5bpc: *const QuicModel,
+    buckets_ptrs: ?*QuicBucket, // Current bucket pointer
+
+    fn init(allocator: Allocator, model_8bpc: *const QuicModel, model_5bpc: *const QuicModel) QuicChannel {
+        return QuicChannel{
+            .state = CommonState.init(),
+            .family_stat_8bpc = QuicFamilyStat.init(allocator),
+            .family_stat_5bpc = QuicFamilyStat.init(allocator),
+            .correlate_row = CorrelateRow.init(allocator),
+            .model_8bpc = model_8bpc,
+            .model_5bpc = model_5bpc,
+            .buckets_ptrs = null,
+        };
+    }
+
+    fn deinit(self: *QuicChannel) void {
+        self.family_stat_8bpc.deinit();
+        self.family_stat_5bpc.deinit();
+        self.correlate_row.deinit();
+    }
+
+    fn reste(self: *QuicChannel, bpc: u32) !bool {
+        self.state.reste();
+
+        if (bpc == 8) {
+            _ = try self.family_stat_8bpc.fillModelStructures(self.model_8bpc);
+        } else {
+            _ = try self.family_stat_5bpc.fillModelStructures(self.model_5bpc);
+        }
+
+        return true;
+    }
+};
+
+// Main encoder structure
+pub const QuicEncoder = struct {
+    allocator: Allocator,
+    rgb_state: CommonState,
+    model_8bpc: QuicModel,
+    model_5bpc: QuicModel,
+    channels: [4]QuicChannel,
+
+    // Image properties
+    image_type: u32,
+    width: u32,
+    height: u32,
+
+    // I/O state
+    io_idx: u32,
+    io_available_bits: u32,
+    io_word: u32,
+    io_next_word: u32,
+    io_now: []const u8,
+    io_end: u32,
+    rows_completed: u32,
+
+    pub fn init(allocator: Allocator) !QuicEncoder {
+        var encoder = QuicEncoder{
+            .allocator = allocator,
+            .rgb_state = CommonState.init(),
+            .model_8bpc = QuicModel.init(8),
+            .model_5bpc = QuicModel.init(5),
+            .channels = undefined,
+            .image_type = 0,
+            .width = 0,
+            .height = 0,
+            .io_idx = 0,
+            .io_available_bits = 0,
+            .io_word = 0,
+            .io_next_word = 0,
+            .io_now = &[_]u8{},
+            .io_end = 0,
+            .rows_completed = 0,
+        };
+
+        // Initialize channels
+        for (0..4) |i| {
+            encoder.channels[i] = QuicChannel.init(allocator, &encoder.model_8bpc, &encoder.model_5bpc);
+        }
+
+        return encoder;
+    }
+
+    pub fn deinit(self: *QuicEncoder) void {
+        for (0..4) |i| {
+            self.channels[i].deinit();
+        }
+    }
+};
