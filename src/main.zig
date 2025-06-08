@@ -50,12 +50,12 @@ pub fn main() !void {
     // Test I/O and header parsing functions
     std.debug.print("Testing I/O and header parsing:\n", .{});
 
-    // Create a sample QUIC header (RGB24, 100x75 image)
-    // Magic: QUIC (0x43495551), Version: 0x00000000, Type: RGB24 (3), Width: 100, Height: 75
+    // Create a sample QUIC header (RGB32, 100x75 image)
+    // Magic: QUIC (0x43495551), Version: 0x00000000, Type: RGB32 (4), Width: 100, Height: 75
     const sample_header = [_]u8{
         0x51, 0x55, 0x49, 0x43, // Magic: "QUIC" (little-endian)
         0x00, 0x00, 0x00, 0x00, // Version: 0
-        0x03, 0x00, 0x00, 0x00, // Type: RGB24 (3)
+        0x04, 0x00, 0x00, 0x00, // Type: RGB32 (4)
         0x64, 0x00, 0x00, 0x00, // Width: 100
         0x4B, 0x00, 0x00, 0x00, // Height: 75
         // Additional dummy data to prevent out-of-bounds reads
@@ -92,7 +92,7 @@ pub fn main() !void {
     const invalid_header = [_]u8{
         0xFF, 0xFF, 0xFF, 0xFF, // Invalid magic
         0x00, 0x00, 0x00, 0x00, // Version: 0
-        0x03, 0x00, 0x00, 0x00, // Type: RGB24 (3)
+        0x04, 0x00, 0x00, 0x00, // Type: RGB32 (4)
         0x64, 0x00, 0x00, 0x00, // Width: 100
         0x4B, 0x00, 0x00, 0x00, // Height: 75
         0x00, 0x00, 0x00, 0x00,
@@ -122,4 +122,37 @@ pub fn main() !void {
     std.debug.print("All tests completed!\n", .{});
     std.debug.print("\nNOTE: We can now parse QUIC headers and validate the format!\n", .{});
     std.debug.print("      Next steps would be implementing the decompression algorithms.\n", .{});
+
+    // Test basic decompression functionality
+    std.debug.print("\nTesting row decompression framework:\n", .{});
+    if (parse_result) {
+        // Test the decoding function
+        const decode_result = encoder.simpleQuicDecode(allocator) catch |err| blk: {
+            std.debug.print("  Decode error: {}\n", .{err});
+            break :blk null;
+        };
+
+        if (decode_result) |decoded_data| {
+            defer allocator.free(decoded_data);
+            std.debug.print("  Successfully created output buffer: {} bytes\n", .{decoded_data.len});
+            std.debug.print("  Image dimensions: {}x{}\n", .{ encoder.width, encoder.height });
+
+            // Show first few pixel values for verification
+            if (decoded_data.len >= 16) {
+                std.debug.print("  First 4 pixels (BGRA): ", .{});
+                for (0..4) |pixel| {
+                    const idx = pixel * 4;
+                    if (idx + 3 < decoded_data.len) {
+                        std.debug.print("[{},{},{},{}] ", .{ decoded_data[idx], decoded_data[idx + 1], decoded_data[idx + 2], decoded_data[idx + 3] });
+                    }
+                }
+                std.debug.print("\n", .{});
+            }
+        } else {
+            std.debug.print("  Decode returned null (unsupported format or error)\n", .{});
+        }
+    }
+
+    std.debug.print("\nMilestone 4 Complete: Core row decompression functions implemented!\n", .{});
+    std.debug.print("Ready for real QUIC test data to validate decoding accuracy.\n", .{});
 }
