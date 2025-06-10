@@ -55,6 +55,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
 
+    // Integration tests
+    const integration_tests = b.addTest(.{
+        .root_source_file = b.path("src/integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests against JavaScript reference");
+    integration_test_step.dependOn(&run_integration_tests.step);
+
     // Benchmark step (for performance testing)
     const bench_exe = b.addExecutable(.{
         .name = "quic-bench",

@@ -19,8 +19,10 @@ csrc/
 c_decoded*
 quic_decode_reference
 
-# Scripts
+# Scripts and debugging tools
 test_*.sh
+*.py
+compare_outputs.*
 
 # IDE and editor files
 .vscode/
