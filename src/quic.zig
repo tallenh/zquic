@@ -24,13 +24,13 @@ const Family = struct {
     not_gr_cwlen: [8]u32,
     not_gr_prefix_mask: [8]u32,
     not_gr_suffix_len: [8]u32,
-    xlat_u2l: [256]u32, // Extended to handle 8-bit values
-    xlat_l2u: [256]u32, // Extended to handle 8-bit values
+    xlat_u2l: [256]u32, // 8-bit lookup table (JavaScript behavior)
+    xlat_l2u: [256]u32, // 8-bit lookup table (JavaScript behavior)
 };
 
 // Global lookup tables (translated from JavaScript arrays)
 var family_5bpc: Family = undefined;
-var family_8bpc: Family = undefined;
+pub var family_8bpc: Family = undefined;
 
 // Bit mask lookup table (bppmask from JavaScript)
 const BPP_MASK = [33]u32{
@@ -206,6 +206,19 @@ pub fn cntLZeroes(bits: u8) u8 {
     return L_ZEROES[bits];
 }
 
+/// Count leading zeroes in a 32-bit value (matches JavaScript cnt_l_zeroes)
+pub fn cntLZeroes32(bits: u32) u32 {
+    if ((bits & 0xff800000) != 0) {
+        return L_ZEROES[bits >> 24];
+    } else if ((bits & 0xffff8000) != 0) {
+        return 8 + L_ZEROES[(bits >> 16) & 0xFF];
+    } else if ((bits & 0xffffff80) != 0) {
+        return 16 + L_ZEROES[(bits >> 8) & 0xFF];
+    } else {
+        return 24 + L_ZEROES[bits & 0xFF];
+    }
+}
+
 /// Initialize the QUIC library
 pub fn init() !void {
     if (!need_init) return;
@@ -269,9 +282,9 @@ pub fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
     var cwlen: u32 = undefined;
 
     if (bits > family_8bpc.not_gr_prefix_mask[l]) {
-        const zeroprefix = cntLZeroes(@as(u8, @truncate(bits >> 24)));
+        const zeroprefix = cntLZeroes32(bits);
         cwlen = zeroprefix + 1 + l;
-        rc = (@as(u32, zeroprefix) << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
+        rc = (zeroprefix << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
     } else {
         cwlen = family_8bpc.not_gr_cwlen[l];
         rc = family_8bpc.n_gr_codewords[l] + ((bits >> @intCast(32 - cwlen)) & BPP_MASK[family_8bpc.not_gr_suffix_len[l]]);
@@ -287,6 +300,18 @@ pub fn golombCodeLen8bpc(n: u32, l: u32) u32 {
     } else {
         return family_8bpc.not_gr_cwlen[l];
     }
+}
+
+/// Bounds-checked access to xlat_l2u array (matches JavaScript behavior)
+/// Returns 0 for out-of-bounds access (simulates JavaScript undefined -> 0)
+fn getXlatL2u(rc: u32) u32 {
+    return if (rc < family_8bpc.xlat_l2u.len) family_8bpc.xlat_l2u[rc] else 0;
+}
+
+/// Safe bucket access that matches JavaScript behavior
+/// Returns null for out-of-bounds access (simulates JavaScript undefined)
+fn getBucket(buckets: []?*QuicBucket, index: u32) ?*QuicBucket {
+    return if (index < buckets.len) buckets[index] else null;
 }
 
 // Forward declarations for cross-references
@@ -871,7 +896,342 @@ pub const QuicEncoder = struct {
         return runlen;
     }
 
-    /// Generic template for RGB row segment decompression (RGB32/RGB24)
+    /// Generic template for RGB row segment decompression (RGB32/RGB24) - SUBSEQUENT ROWS with RLE
+    fn quicRgbUncompressRowSegGeneric(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8, start_i: u32, end: u32, bpc: u32, bpc_mask: u32, comptime pixel_size: u32, comptime has_padding: bool) !void {
+        const n_channels: u32 = 3;
+        var i = start_i;
+        var stopidx: u32 = undefined;
+        const waitmask = BPP_MASK[self.rgb_state.wmidx];
+
+        var run_index: u32 = 0;
+        var run_end: u32 = undefined;
+
+        if (i == 0) {
+            // Process first pixel of the row
+            const pixel_idx = i * pixel_size;
+
+            // Set padding byte for RGB32
+            if (has_padding) {
+                cur_row[pixel_idx + RGB32_PIXEL_PAD] = 0;
+            }
+
+            var c: u32 = 0;
+            while (c < n_channels) : (c += 1) {
+                const channel = &self.channels[c];
+                const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
+                if (bucket) |b| {
+                    const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                    channel.correlate_row.row.items[0] = golomb_result.rc;
+
+                    const color_offset = if (has_padding) (2 - c) else (2 - c);
+                    const decoded_val = getXlatL2u(golomb_result.rc) + prev_row[pixel_idx + color_offset];
+                    cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
+
+                    try self.decodeEatbits(golomb_result.codewordlen);
+                }
+            }
+
+            if (self.rgb_state.waitcnt > 0) {
+                self.rgb_state.waitcnt -= 1;
+            } else {
+                self.rgb_state.waitcnt = self.rgb_state.tabrand() & waitmask;
+                c = 0;
+                while (c < n_channels) : (c += 1) {
+                    const channel = &self.channels[c];
+                    const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
+                    if (bucket) |b| {
+                        b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[0], bpc);
+                    }
+                }
+            }
+            i += 1;
+            stopidx = i + self.rgb_state.waitcnt;
+        } else {
+            stopidx = i + self.rgb_state.waitcnt;
+        }
+
+        // Main decompression loop with RLE detection
+        while (true) {
+            var rc: u32 = 0;
+
+            // Process pixels until stopidx, checking for RLE conditions
+            while (stopidx < end and rc == 0) {
+                var c: u32 = 0;
+                while (i <= stopidx and rc == 0) : (i += 1) {
+                    const pixel_idx = i * pixel_size;
+                    const pixelm1_idx = (i - 1) * pixel_size;
+                    const pixelm2_idx = if (i >= 2) (i - 2) * pixel_size else 0;
+
+                    // Set padding byte for RGB32
+                    if (has_padding) {
+                        cur_row[pixel_idx + RGB32_PIXEL_PAD] = 0;
+                    }
+
+                    // Check RLE condition: ALL three color channels must match between prev_row[i-1] and prev_row[i]
+                    // AND ALL three color channels must match between cur_row[i-1] and cur_row[i-2]
+                    const r_offset = if (has_padding) RGB32_PIXEL_R else 2;
+                    const g_offset = if (has_padding) RGB32_PIXEL_G else 1;
+                    const b_offset = if (has_padding) RGB32_PIXEL_B else 0;
+
+                    const prev_row_match = (i > 0 and
+                        prev_row[pixelm1_idx + r_offset] == prev_row[pixel_idx + r_offset] and
+                        prev_row[pixelm1_idx + g_offset] == prev_row[pixel_idx + g_offset] and
+                        prev_row[pixelm1_idx + b_offset] == prev_row[pixel_idx + b_offset]);
+
+                    const cur_row_match = (run_index != i and i > 2 and
+                        cur_row[pixelm1_idx + r_offset] == cur_row[pixelm2_idx + r_offset] and
+                        cur_row[pixelm1_idx + g_offset] == cur_row[pixelm2_idx + g_offset] and
+                        cur_row[pixelm1_idx + b_offset] == cur_row[pixelm2_idx + b_offset]);
+
+                    if (prev_row_match and cur_row_match) {
+                        // RLE detected - decode run length
+                        self.rgb_state.waitcnt = @intCast(@as(i32, @intCast(stopidx)) - @as(i32, @intCast(i)));
+                        run_index = i;
+
+                        run_end = i + try self.decodeRun(&self.rgb_state);
+
+                        // Copy all color channels for the run
+                        while (i < run_end) : (i += 1) {
+                            const run_pixel_idx = i * pixel_size;
+                            const run_pixelm1_idx = (i - 1) * pixel_size;
+
+                            if (has_padding) {
+                                cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                            }
+                            cur_row[run_pixel_idx + r_offset] = cur_row[run_pixelm1_idx + r_offset];
+                            cur_row[run_pixel_idx + g_offset] = cur_row[run_pixelm1_idx + g_offset];
+                            cur_row[run_pixel_idx + b_offset] = cur_row[run_pixelm1_idx + b_offset];
+                        }
+
+                        if (i == end) {
+                            return;
+                        } else {
+                            stopidx = i + self.rgb_state.waitcnt;
+                            rc = 1;
+                            break;
+                        }
+                    }
+
+                    // Normal pixel decoding (no RLE) - decode all channels
+                    if (has_padding) {
+                        cur_row[pixel_idx + RGB32_PIXEL_PAD] = 0;
+                    }
+
+                    c = 0;
+                    while (c < n_channels) : (c += 1) {
+                        const color_offset = if (has_padding) (2 - c) else (2 - c);
+                        const channel = &self.channels[c];
+
+                        if (channel.correlate_row.row.items.len > i - 1) {
+                            const prev_corr_val = channel.correlate_row.row.items[i - 1];
+                            const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_corr_val);
+                            if (bucket) |b| {
+                                const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+
+                                // Ensure correlate_row is large enough
+                                while (channel.correlate_row.row.items.len <= i) {
+                                    try channel.correlate_row.row.append(0);
+                                }
+                                channel.correlate_row.row.items[i] = golomb_result.rc;
+
+                                // Decode with correlation: current + (previous_row + current_row)/2
+                                const prev_row_val = @as(u32, prev_row[pixel_idx + color_offset]);
+                                const cur_row_prev_val = @as(u32, cur_row[pixelm1_idx + color_offset]);
+                                const corr_base = (prev_row_val + cur_row_prev_val) >> 1;
+                                const decoded_val = getXlatL2u(golomb_result.rc) + corr_base;
+                                cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
+
+                                try self.decodeEatbits(golomb_result.codewordlen);
+                            }
+                        }
+                    }
+                }
+
+                if (rc != 0) break;
+
+                // Update model for the batch
+                c = 0;
+                while (c < n_channels) : (c += 1) {
+                    const channel = &self.channels[c];
+                    if (channel.correlate_row.row.items.len > stopidx) {
+                        const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
+                        if (bucket) |b| {
+                            b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
+                        }
+                    }
+                }
+
+                stopidx = i + (self.rgb_state.tabrand() & waitmask);
+            }
+
+            // Final pixel processing with RLE check
+            while (i < end and rc == 0) : (i += 1) {
+                const pixel_idx = i * pixel_size;
+                const pixelm1_idx = (i - 1) * pixel_size;
+                const pixelm2_idx = if (i >= 2) (i - 2) * pixel_size else 0;
+
+                // Set padding byte for RGB32
+                if (has_padding) {
+                    cur_row[pixel_idx + RGB32_PIXEL_PAD] = 0;
+                }
+
+                // Check RLE condition: ALL three color channels must match
+                const r_offset = if (has_padding) RGB32_PIXEL_R else 2;
+                const g_offset = if (has_padding) RGB32_PIXEL_G else 1;
+                const b_offset = if (has_padding) RGB32_PIXEL_B else 0;
+
+                const prev_row_match = (i > 0 and
+                    prev_row[pixelm1_idx + r_offset] == prev_row[pixel_idx + r_offset] and
+                    prev_row[pixelm1_idx + g_offset] == prev_row[pixel_idx + g_offset] and
+                    prev_row[pixelm1_idx + b_offset] == prev_row[pixel_idx + b_offset]);
+
+                const cur_row_match = (run_index != i and i > 2 and
+                    cur_row[pixelm1_idx + r_offset] == cur_row[pixelm2_idx + r_offset] and
+                    cur_row[pixelm1_idx + g_offset] == cur_row[pixelm2_idx + g_offset] and
+                    cur_row[pixelm1_idx + b_offset] == cur_row[pixelm2_idx + b_offset]);
+
+                if (prev_row_match and cur_row_match) {
+                    // RLE detected
+                    self.rgb_state.waitcnt = @intCast(@as(i32, @intCast(stopidx)) - @as(i32, @intCast(i)));
+                    run_index = i;
+
+                    run_end = i + try self.decodeRun(&self.rgb_state);
+
+                    // Copy all color channels for the run
+                    while (i < run_end) : (i += 1) {
+                        const run_pixel_idx = i * pixel_size;
+                        const run_pixelm1_idx = (i - 1) * pixel_size;
+
+                        if (has_padding) {
+                            cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                        }
+                        cur_row[run_pixel_idx + r_offset] = cur_row[run_pixelm1_idx + r_offset];
+                        cur_row[run_pixel_idx + g_offset] = cur_row[run_pixelm1_idx + g_offset];
+                        cur_row[run_pixel_idx + b_offset] = cur_row[run_pixelm1_idx + b_offset];
+                    }
+
+                    if (i == end) {
+                        return;
+                    } else {
+                        stopidx = i + self.rgb_state.waitcnt;
+                        rc = 1;
+                        break;
+                    }
+                }
+
+                // Normal pixel decoding - decode all channels
+                if (has_padding) {
+                    cur_row[pixel_idx + RGB32_PIXEL_PAD] = 0;
+                }
+
+                var c: u32 = 0;
+                while (c < n_channels) : (c += 1) {
+                    const color_offset = if (has_padding) (2 - c) else (2 - c);
+                    const channel = &self.channels[c];
+
+                    if (channel.correlate_row.row.items.len > i - 1) {
+                        const prev_corr_val = channel.correlate_row.row.items[i - 1];
+                        const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_corr_val);
+                        if (bucket) |b| {
+                            const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+
+                            // Ensure correlate_row is large enough
+                            while (channel.correlate_row.row.items.len <= i) {
+                                try channel.correlate_row.row.append(0);
+                            }
+                            channel.correlate_row.row.items[i] = golomb_result.rc;
+
+                            // Decode with correlation
+                            const prev_row_val = @as(u32, prev_row[pixel_idx + color_offset]);
+                            const cur_row_prev_val = @as(u32, cur_row[pixelm1_idx + color_offset]);
+                            const corr_base = (prev_row_val + cur_row_prev_val) >> 1;
+                            const decoded_val = getXlatL2u(golomb_result.rc) + corr_base;
+                            cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
+
+                            try self.decodeEatbits(golomb_result.codewordlen);
+                        }
+                    }
+                }
+            }
+
+            if (rc == 0) {
+                self.rgb_state.waitcnt = @intCast(@as(i32, @intCast(stopidx)) - @as(i32, @intCast(end)));
+                return;
+            }
+        }
+    }
+
+    /// Decompress a segment of a subsequent row for RGB32 format with RLE support
+    pub fn quicRgb32UncompressRowSeg(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8, start_i: u32, end: u32, bpc: u32, bpc_mask: u32) !void {
+        return self.quicRgbUncompressRowSegGeneric(prev_row, cur_row, start_i, end, bpc, bpc_mask, RGB32_PIXEL_SIZE, true);
+    }
+
+    /// Decompress a segment of a subsequent row for RGB24 format with RLE support
+    pub fn quicRgb24UncompressRowSeg(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8, start_i: u32, end: u32, bpc: u32, bpc_mask: u32) !void {
+        return self.quicRgbUncompressRowSegGeneric(prev_row, cur_row, start_i, end, bpc, bpc_mask, RGB24_PIXEL_SIZE, false);
+    }
+
+    /// Decompress a subsequent row for RGB32 format (with previous row correlation and RLE)
+    pub fn quicRgb32UncompressRow(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8) !void {
+        const bpc: u32 = 8;
+        const bpc_mask: u32 = 0xff;
+        var pos: u32 = 0;
+        var width = self.width;
+
+        const wmi_max = DEF_WMI_MAX;
+        const wmi_next = DEF_WMI_NEXT;
+
+        while ((wmi_max > self.rgb_state.wmidx) and (self.rgb_state.wmileft <= width)) {
+            if (self.rgb_state.wmileft > 0) {
+                try self.quicRgb32UncompressRowSeg(prev_row, cur_row, pos, pos + self.rgb_state.wmileft, bpc, bpc_mask);
+                pos += self.rgb_state.wmileft;
+                width -= self.rgb_state.wmileft;
+            }
+
+            self.rgb_state.wmidx += 1;
+            self.rgb_state.setWmTrigger();
+            self.rgb_state.wmileft = wmi_next;
+        }
+
+        if (width > 0) {
+            try self.quicRgb32UncompressRowSeg(prev_row, cur_row, pos, pos + width, bpc, bpc_mask);
+            if (wmi_max > self.rgb_state.wmidx) {
+                self.rgb_state.wmileft -= width;
+            }
+        }
+    }
+
+    /// Decompress a subsequent row for RGB24 format (with previous row correlation and RLE)
+    pub fn quicRgb24UncompressRow(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8) !void {
+        const bpc: u32 = 8;
+        const bpc_mask: u32 = 0xff;
+        var pos: u32 = 0;
+        var width = self.width;
+
+        const wmi_max = DEF_WMI_MAX;
+        const wmi_next = DEF_WMI_NEXT;
+
+        while ((wmi_max > self.rgb_state.wmidx) and (self.rgb_state.wmileft <= width)) {
+            if (self.rgb_state.wmileft > 0) {
+                try self.quicRgb24UncompressRowSeg(prev_row, cur_row, pos, pos + self.rgb_state.wmileft, bpc, bpc_mask);
+                pos += self.rgb_state.wmileft;
+                width -= self.rgb_state.wmileft;
+            }
+
+            self.rgb_state.wmidx += 1;
+            self.rgb_state.setWmTrigger();
+            self.rgb_state.wmileft = wmi_next;
+        }
+
+        if (width > 0) {
+            try self.quicRgb24UncompressRowSeg(prev_row, cur_row, pos, pos + width, bpc, bpc_mask);
+            if (wmi_max > self.rgb_state.wmidx) {
+                self.rgb_state.wmileft -= width;
+            }
+        }
+    }
+
+    /// Generic template for RGB row segment decompression (RGB32/RGB24) - FIRST ROW
     fn quicRgbUncompressRow0SegGeneric(self: *QuicEncoder, start_i: u32, cur_row: []u8, end: u32, waitmask: u32, bpc: u32, bpc_mask: u32, comptime pixel_size: u32, comptime has_padding: bool) !void {
         const n_channels: u32 = 3;
         var i = start_i;
@@ -892,7 +1252,7 @@ pub const QuicEncoder = struct {
                     try channel.correlate_row.row.append(golomb_result.rc);
                     if (channel.correlate_row.row.items.len == 1) {
                         // This is index 0
-                        cur_row[2 - c] = @intCast(family_8bpc.xlat_l2u[golomb_result.rc] & 0xFF);
+                        cur_row[2 - c] = @intCast(getXlatL2u(golomb_result.rc) & 0xFF);
                     }
                     try self.decodeEatbits(golomb_result.codewordlen);
                 }
@@ -934,14 +1294,14 @@ pub const QuicEncoder = struct {
                     const channel = &self.channels[c];
                     if (channel.correlate_row.row.items.len > 0) {
                         const prev_val = channel.correlate_row.row.items[i - 1];
-                        const bucket = channel.family_stat_8bpc.buckets_ptrs.items[prev_val];
+                        const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                         if (bucket) |b| {
                             const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                             try channel.correlate_row.row.append(golomb_result.rc);
 
                             const prev_pixel_idx = (i - 1) * pixel_size;
                             const color_offset = if (has_padding) (2 - c) else (2 - c);
-                            const decoded_val = family_8bpc.xlat_l2u[golomb_result.rc] + cur_row[prev_pixel_idx + color_offset];
+                            const decoded_val = getXlatL2u(golomb_result.rc) + cur_row[prev_pixel_idx + color_offset];
                             cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
 
                             try self.decodeEatbits(golomb_result.codewordlen);
@@ -955,7 +1315,7 @@ pub const QuicEncoder = struct {
             while (c < n_channels) : (c += 1) {
                 const channel = &self.channels[c];
                 if (channel.correlate_row.row.items.len > stopidx) {
-                    const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.row.items[stopidx - 1]];
+                    const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
                     if (bucket) |b| {
                         b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
                     }
@@ -977,14 +1337,14 @@ pub const QuicEncoder = struct {
                 const channel = &self.channels[c];
                 if (channel.correlate_row.row.items.len > 0) {
                     const prev_val = channel.correlate_row.row.items[i - 1];
-                    const bucket = channel.family_stat_8bpc.buckets_ptrs.items[prev_val];
+                    const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                     if (bucket) |b| {
                         const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                         try channel.correlate_row.row.append(golomb_result.rc);
 
                         const prev_pixel_idx = (i - 1) * pixel_size;
                         const color_offset = if (has_padding) (2 - c) else (2 - c);
-                        const decoded_val = family_8bpc.xlat_l2u[golomb_result.rc] + cur_row[prev_pixel_idx + color_offset];
+                        const decoded_val = getXlatL2u(golomb_result.rc) + cur_row[prev_pixel_idx + color_offset];
                         cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
 
                         try self.decodeEatbits(golomb_result.codewordlen);
@@ -1005,7 +1365,7 @@ pub const QuicEncoder = struct {
         return self.quicRgbUncompressRow0SegGeneric(start_i, cur_row, end, waitmask, bpc, bpc_mask, RGB24_PIXEL_SIZE, false);
     }
 
-    /// Generic optimized row decompression for RGB formats
+    /// Generic optimized row decompression for RGB formats - FIRST ROW
     fn quicRgbUncompressRow0Generic(self: *QuicEncoder, cur_row: []u8, is_rgb32: bool) !void {
         const bpc: u32 = 8;
         const bpc_mask: u32 = 0xff;
@@ -1080,12 +1440,17 @@ pub const QuicEncoder = struct {
         const width = self.width;
         const row_size = width * bytes_per_pixel;
 
-        // Optimized RGB decompression with unified handling
+        // Proper QUIC decompression following JavaScript reference implementation
         if (self.image_type == Constants.QUIC_IMAGE_TYPE_RGB32 or self.image_type == Constants.QUIC_IMAGE_TYPE_RGB24) {
+            // Initialize correlate_row.zero for all channels
+            for (0..3) |c| {
+                self.channels[c].correlate_row.zero = 0;
+            }
+
             const first_row_slice = output_buffer[0..row_size];
 
-            // Decompress first row using optimized function
-            const decode_success = blk: {
+            // Decompress first row using row0 function
+            const first_row_success = blk: {
                 if (self.image_type == Constants.QUIC_IMAGE_TYPE_RGB32) {
                     self.quicRgb32UncompressRow0(first_row_slice) catch break :blk false;
                 } else {
@@ -1094,7 +1459,7 @@ pub const QuicEncoder = struct {
                 break :blk true;
             };
 
-            if (!decode_success) {
+            if (!first_row_success) {
                 // Fallback to test pattern if decode fails
                 std.debug.print("    Row decompression failed (expected with test data): error.DecodeFailed\n", .{});
                 const pattern_multiplier: u32 = if (self.image_type == Constants.QUIC_IMAGE_TYPE_RGB32) 79 else 97;
@@ -1102,12 +1467,35 @@ pub const QuicEncoder = struct {
                     output_buffer[i] = @intCast((i * pattern_multiplier) & 0xFF);
                 }
             } else {
-                // Optimized row copying - copy first row to all subsequent rows
+                // Decompress subsequent rows using proper multi-line decoding
                 for (1..self.height) |row| {
-                    const dest_start = row * row_size;
-                    const dest_end = dest_start + row_size;
-                    if (dest_end <= output_buffer.len) {
-                        @memcpy(output_buffer[dest_start..dest_end], first_row_slice);
+                    const prev_row_start = (row - 1) * row_size;
+                    const prev_row_slice = output_buffer[prev_row_start .. prev_row_start + row_size];
+
+                    const cur_row_start = row * row_size;
+                    const cur_row_slice = output_buffer[cur_row_start .. cur_row_start + row_size];
+
+                    // Set correlate_row.zero from first pixel of previous row
+                    for (0..3) |c| {
+                        if (self.channels[c].correlate_row.row.items.len > 0) {
+                            self.channels[c].correlate_row.zero = self.channels[c].correlate_row.row.items[0];
+                        }
+                    }
+
+                    // Decompress this row with correlation to previous row
+                    const row_success = blk: {
+                        if (self.image_type == Constants.QUIC_IMAGE_TYPE_RGB32) {
+                            self.quicRgb32UncompressRow(prev_row_slice, cur_row_slice) catch break :blk false;
+                        } else {
+                            self.quicRgb24UncompressRow(prev_row_slice, cur_row_slice) catch break :blk false;
+                        }
+                        break :blk true;
+                    };
+
+                    if (!row_success) {
+                        std.debug.print("    Row {} decompression failed\n", .{row});
+                        // Copy previous row as fallback
+                        @memcpy(cur_row_slice, prev_row_slice);
                     }
                 }
             }

@@ -69,4 +69,19 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // File decoder executable for processing QUIC binary files
+    const decoder_exe = b.addExecutable(.{
+        .name = "quic-decoder",
+        .root_source_file = b.path("src/file_decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    decoder_exe.root_module.addImport("quic", quic_lib.root_module);
+    b.installArtifact(decoder_exe);
+
+    const run_decoder = b.addRunArtifact(decoder_exe);
+    const decoder_step = b.step("decode", "Run the QUIC file decoder");
+    decoder_step.dependOn(&run_decoder.step);
 }
