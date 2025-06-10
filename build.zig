@@ -82,6 +82,21 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    // Performance benchmark with real SPICE data
+    const perf_bench_exe = b.addExecutable(.{
+        .name = "quic-benchmark",
+        .root_source_file = b.path("src/benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    perf_bench_exe.root_module.addImport("quic", quic_lib.root_module);
+    b.installArtifact(perf_bench_exe);
+
+    const run_perf_bench = b.addRunArtifact(perf_bench_exe);
+    const perf_bench_step = b.step("benchmark", "Run performance benchmark with real SPICE data");
+    perf_bench_step.dependOn(&run_perf_bench.step);
+
     // File decoder executable for processing QUIC binary files
     const decoder_exe = b.addExecutable(.{
         .name = "quic-decoder",

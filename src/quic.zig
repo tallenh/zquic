@@ -206,17 +206,10 @@ pub fn cntLZeroes(bits: u8) u8 {
     return L_ZEROES[bits];
 }
 
-/// Count leading zeroes in a 32-bit value (matches JavaScript cnt_l_zeroes)
-pub fn cntLZeroes32(bits: u32) u32 {
-    if ((bits & 0xff800000) != 0) {
-        return L_ZEROES[bits >> 24];
-    } else if ((bits & 0xffff8000) != 0) {
-        return 8 + L_ZEROES[(bits >> 16) & 0xFF];
-    } else if ((bits & 0xffffff80) != 0) {
-        return 16 + L_ZEROES[(bits >> 8) & 0xFF];
-    } else {
-        return 24 + L_ZEROES[bits & 0xFF];
-    }
+/// Count leading zeroes in a 32-bit value (optimized with Zig builtin)
+inline fn cntLZeroes32(bits: u32) u32 {
+    // Use Zig's built-in count leading zeros - single CPU instruction
+    return @clz(bits);
 }
 
 /// Initialize the QUIC library
