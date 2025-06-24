@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const fast_golomb = @import("fast_golomb.zig");
 const Allocator = std.mem.Allocator;
 
 // Constants from the original JavaScript
@@ -286,8 +287,29 @@ pub inline fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
     }
 }
 
+/// Fast-path: decode first symbol using 12-bit LUT when l == 0.
+const FastOneResult = struct { rc: u32, codewordlen: u32 };
+inline fn fastGolombOne8bpc(bits: u32) ?FastOneResult {
+    // Decode first residual using 12-bit table; returns null if no fast entry
+
+    const entry = fast_golomb.fastGolombBatch(bits);
+    if (entry.count == 0) return null;
+    return FastOneResult{ .rc = entry.rc[0], .codewordlen = entry.bits_used };
+}
+
+/// Unified fast/slow Golomb decode for 8bpc (bestcode 0 uses LUT)
+inline fn golombDec8bpcFast(l: u32, bits: u32) GolombResult {
+    if (l == 0) {
+        if (fastGolombOne8bpc(bits)) |fr| {
+            return GolombResult{ .rc = fr.rc, .codewordlen = fr.codewordlen };
+        }
+    }
+    return golombDecoding8bpc(l, bits);
+}
+
 /// Calculate Golomb code length for 8 bits per component
 pub fn golombCodeLen8bpc(n: u32, l: u32) u32 {
+    // unchanged below
     if (n < family_8bpc.n_gr_codewords[l]) {
         return (n >> @intCast(l)) + 1 + l;
     } else {
@@ -946,7 +968,7 @@ pub const QuicEncoder = struct {
                 const channel = &self.channels[c];
                 const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
                 if (bucket) |b| {
-                    const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                    const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
                     channel.correlate_row.row.items[0] = golomb_result.rc;
 
                     const color_offset = 2 - c; // Optimized: removed redundant branch
@@ -1056,7 +1078,7 @@ pub const QuicEncoder = struct {
                             else
                                 null;
                             if (bucket) |b| {
-                                const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                                const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
 
                                 // Ensure correlate_row is large enough (optimized with pre-allocation)
                                 if (channel.correlate_row.row.items.len <= i) {
@@ -1090,8 +1112,12 @@ pub const QuicEncoder = struct {
                 while (c < n_channels) : (c += 1) {
                     const channel = &self.channels[c];
                     if (channel.correlate_row.row.items.len > stopidx) {
-                        const b = bucketAt(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
-                        b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
+                        const idx_prev = channel.correlate_row.row.items[stopidx - 1];
+                        if (idx_prev < channel.family_stat_8bpc.buckets_ptrs.items.len) {
+                            if (channel.family_stat_8bpc.buckets_ptrs.items[idx_prev]) |b| {
+                                b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
+                            }
+                        }
                     }
                 }
 
@@ -1167,7 +1193,7 @@ pub const QuicEncoder = struct {
                         const prev_corr_val = channel.correlate_row.row.items[i - 1];
                         const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_corr_val);
                         if (bucket) |b| {
-                            const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                            const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
 
                             // Ensure correlate_row is large enough (optimized)
                             if (channel.correlate_row.row.items.len <= i) {
@@ -1289,7 +1315,7 @@ pub const QuicEncoder = struct {
                 const channel = &self.channels[c];
                 const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
                 if (bucket) |b| {
-                    const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                    const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
                     // Optimized: use direct access since we pre-allocated
                     const new_len = channel.correlate_row.row.items.len + 1;
                     channel.correlate_row.row.items.len = new_len;
@@ -1340,7 +1366,7 @@ pub const QuicEncoder = struct {
                         const prev_val = channel.correlate_row.row.items[i - 1];
                         const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                         if (bucket) |b| {
-                            const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                            const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
                             // Optimized: use direct access since we pre-allocated
                             const new_len = channel.correlate_row.row.items.len + 1;
                             channel.correlate_row.row.items.len = new_len;
@@ -1386,7 +1412,7 @@ pub const QuicEncoder = struct {
                     const prev_val = channel.correlate_row.row.items[i - 1];
                     const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                     if (bucket) |b| {
-                        const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
+                        const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
                         // Optimized: use direct access since we pre-allocated
                         const new_len = channel.correlate_row.row.items.len + 1;
                         channel.correlate_row.row.items.len = new_len;
