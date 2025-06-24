@@ -305,12 +305,19 @@ inline fn getXlatL2u(rc: u32) u32 {
 /// Safe bucket access that matches JavaScript behavior
 /// Returns null for out-of-bounds access (simulates JavaScript undefined)
 inline fn getBucket(buckets: []?*QuicBucket, index: u32) ?*QuicBucket {
-    // Hot path optimization: assume most accesses are in bounds for better branch prediction
+    // Deprecated: retained for compatibility, avoid in hot paths
     if (index < buckets.len) {
         return buckets[index];
     }
     return null;
 }
+
+/// Fast bucket access (unchecked, assumes index < buckets.len and never null)
+inline fn bucketAt(buckets: []?*QuicBucket, index: u32) *QuicBucket {
+    return buckets[index].?;
+}
+
+
 
 // Forward declarations for cross-references
 const CommonState = struct {
@@ -816,7 +823,10 @@ pub const QuicEncoder = struct {
         self.height = self.io_word;
         try self.decodeEat32bits();
 
-        // Get bits per component and reset channels
+        // Pre-allocate per-row arrays to avoid reallocations
+    try self.preAllocateCorrelateRows();
+
+    // Get bits per component and reset channels
         const bpc = quicImageBpc(self.image_type);
         if (bpc == 0) {
             std.debug.print("quic: invalid image type {}\n", .{self.image_type});
@@ -911,6 +921,9 @@ pub const QuicEncoder = struct {
 
     /// Generic template for RGB row segment decompression (RGB32/RGB24) - SUBSEQUENT ROWS with RLE
     fn quicRgbUncompressRowSegGeneric(self: *QuicEncoder, prev_row: []const u8, cur_row: []u8, start_i: u32, end: u32, bpc: u32, bpc_mask: u32, comptime pixel_size: u32, comptime has_padding: bool) !void {
+        // Hot-path: disable runtime safety checks (bounds/pointer) for speed.
+        @setRuntimeSafety(false);
+
         const n_channels: u32 = 3;
         var i = start_i;
         var stopidx: u32 = undefined;
@@ -1077,10 +1090,8 @@ pub const QuicEncoder = struct {
                 while (c < n_channels) : (c += 1) {
                     const channel = &self.channels[c];
                     if (channel.correlate_row.row.items.len > stopidx) {
-                        const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
-                        if (bucket) |b| {
-                            b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
-                        }
+                        const b = bucketAt(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
+                        b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
                     }
                 }
 
@@ -1260,6 +1271,9 @@ pub const QuicEncoder = struct {
 
     /// Generic template for RGB row segment decompression (RGB32/RGB24) - FIRST ROW
     fn quicRgbUncompressRow0SegGeneric(self: *QuicEncoder, start_i: u32, cur_row: []u8, end: u32, waitmask: u32, bpc: u32, bpc_mask: u32, comptime pixel_size: u32, comptime has_padding: bool) !void {
+        // Hot-path: disable runtime safety checks (bounds/pointer) for speed.
+        @setRuntimeSafety(false);
+
         const n_channels: u32 = 3;
         var i = start_i;
         var stopidx: u32 = undefined;
