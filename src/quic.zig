@@ -269,21 +269,21 @@ const GolombResult = struct {
     rc: u32,
 };
 
-/// Golomb decoding for 8 bits per component
-pub fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
-    var rc: u32 = undefined;
-    var cwlen: u32 = undefined;
+/// Golomb decoding for 8 bits per component - optimized for hot path
+pub inline fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
+    // Performance optimization: use local copies to help with optimization
+    const not_gr_prefix_mask = family_8bpc.not_gr_prefix_mask[l];
 
-    if (bits > family_8bpc.not_gr_prefix_mask[l]) {
+    if (bits > not_gr_prefix_mask) {
         const zeroprefix = cntLZeroes32(bits);
-        cwlen = zeroprefix + 1 + l;
-        rc = (zeroprefix << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
+        const cwlen = zeroprefix + 1 + l;
+        const rc = (zeroprefix << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
+        return GolombResult{ .codewordlen = cwlen, .rc = rc };
     } else {
-        cwlen = family_8bpc.not_gr_cwlen[l];
-        rc = family_8bpc.n_gr_codewords[l] + ((bits >> @intCast(32 - cwlen)) & BPP_MASK[family_8bpc.not_gr_suffix_len[l]]);
+        const cwlen = family_8bpc.not_gr_cwlen[l];
+        const rc = family_8bpc.n_gr_codewords[l] + ((bits >> @intCast(32 - cwlen)) & BPP_MASK[family_8bpc.not_gr_suffix_len[l]]);
+        return GolombResult{ .codewordlen = cwlen, .rc = rc };
     }
-
-    return GolombResult{ .codewordlen = cwlen, .rc = rc };
 }
 
 /// Calculate Golomb code length for 8 bits per component
@@ -297,14 +297,19 @@ pub fn golombCodeLen8bpc(n: u32, l: u32) u32 {
 
 /// Bounds-checked access to xlat_l2u array (matches JavaScript behavior)
 /// Returns 0 for out-of-bounds access (simulates JavaScript undefined -> 0)
-fn getXlatL2u(rc: u32) u32 {
-    return if (rc < family_8bpc.xlat_l2u.len) family_8bpc.xlat_l2u[rc] else 0;
+inline fn getXlatL2u(rc: u32) u32 {
+    // Hot path optimization: most accesses are in bounds, use unchecked access with fallback
+    return if (rc < 256) family_8bpc.xlat_l2u[rc] else 0;
 }
 
 /// Safe bucket access that matches JavaScript behavior
 /// Returns null for out-of-bounds access (simulates JavaScript undefined)
-fn getBucket(buckets: []?*QuicBucket, index: u32) ?*QuicBucket {
-    return if (index < buckets.len) buckets[index] else null;
+inline fn getBucket(buckets: []?*QuicBucket, index: u32) ?*QuicBucket {
+    // Hot path optimization: assume most accesses are in bounds for better branch prediction
+    if (index < buckets.len) {
+        return buckets[index];
+    }
+    return null;
 }
 
 // Forward declarations for cross-references
@@ -578,6 +583,10 @@ const CorrelateRow = struct {
     fn deinit(self: *CorrelateRow) void {
         self.row.deinit();
     }
+
+    fn preAllocate(self: *CorrelateRow, capacity: u32) !void {
+        try self.row.ensureTotalCapacity(capacity);
+    }
 };
 
 // Channel structure
@@ -714,7 +723,7 @@ pub const QuicEncoder = struct {
     }
 
     /// Read a 32-bit word from the byte stream (little-endian)
-    pub fn readIoWord(self: *QuicEncoder) !void {
+    pub inline fn readIoWord(self: *QuicEncoder) !void {
         if (self.io_idx + 4 > self.io_end) {
             return error.OutOfData;
         }
@@ -727,7 +736,7 @@ pub const QuicEncoder = struct {
     }
 
     /// Consume specified number of bits from the bit stream
-    pub fn decodeEatbits(self: *QuicEncoder, len: u32) !void {
+    pub inline fn decodeEatbits(self: *QuicEncoder, len: u32) !void {
         self.io_word <<= @intCast(len);
 
         const delta_signed = @as(i32, @intCast(self.io_available_bits)) - @as(i32, @intCast(len));
@@ -758,6 +767,14 @@ pub const QuicEncoder = struct {
             }
         }
         return true;
+    }
+
+    /// Pre-allocate correlate_row arrays to avoid dynamic allocation during decode
+    pub fn preAllocateCorrelateRows(self: *QuicEncoder) !void {
+        const capacity = self.width; // Each row can have at most width pixels
+        for (0..4) |i| {
+            try self.channels[i].correlate_row.preAllocate(capacity);
+        }
     }
 
     /// Parse QUIC header and validate format
@@ -809,6 +826,9 @@ pub const QuicEncoder = struct {
         if (!(try self.resteChannels(bpc))) {
             return false;
         }
+
+        // Pre-allocate correlate_row arrays to avoid dynamic allocation during decode
+        try self.preAllocateCorrelateRows();
 
         return true;
     }
@@ -916,7 +936,7 @@ pub const QuicEncoder = struct {
                     const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                     channel.correlate_row.row.items[0] = golomb_result.rc;
 
-                    const color_offset = if (has_padding) (2 - c) else (2 - c);
+                    const color_offset = 2 - c; // Optimized: removed redundant branch
                     const decoded_val = getXlatL2u(golomb_result.rc) + prev_row[pixel_idx + color_offset];
                     cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
 
@@ -1012,18 +1032,28 @@ pub const QuicEncoder = struct {
 
                     c = 0;
                     while (c < n_channels) : (c += 1) {
-                        const color_offset = if (has_padding) (2 - c) else (2 - c);
+                        const color_offset = 2 - c; // Optimized: removed redundant branch
                         const channel = &self.channels[c];
 
                         if (channel.correlate_row.row.items.len > i - 1) {
                             const prev_corr_val = channel.correlate_row.row.items[i - 1];
-                            const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_corr_val);
+                            // Hot path optimization: inline bucket access for better performance
+                            const bucket = if (prev_corr_val < channel.family_stat_8bpc.buckets_ptrs.items.len)
+                                channel.family_stat_8bpc.buckets_ptrs.items[prev_corr_val]
+                            else
+                                null;
                             if (bucket) |b| {
                                 const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
 
-                                // Ensure correlate_row is large enough
-                                while (channel.correlate_row.row.items.len <= i) {
-                                    try channel.correlate_row.row.append(0);
+                                // Ensure correlate_row is large enough (optimized with pre-allocation)
+                                if (channel.correlate_row.row.items.len <= i) {
+                                    // Since we pre-allocated capacity, we can directly resize
+                                    const old_len = channel.correlate_row.row.items.len;
+                                    channel.correlate_row.row.items.len = i + 1;
+                                    // Zero out new elements
+                                    for (old_len..channel.correlate_row.row.items.len) |idx| {
+                                        channel.correlate_row.row.items[idx] = 0;
+                                    }
                                 }
                                 channel.correlate_row.row.items[i] = golomb_result.rc;
 
@@ -1119,7 +1149,7 @@ pub const QuicEncoder = struct {
 
                 var c: u32 = 0;
                 while (c < n_channels) : (c += 1) {
-                    const color_offset = if (has_padding) (2 - c) else (2 - c);
+                    const color_offset = 2 - c; // Optimized: removed redundant branch
                     const channel = &self.channels[c];
 
                     if (channel.correlate_row.row.items.len > i - 1) {
@@ -1128,9 +1158,13 @@ pub const QuicEncoder = struct {
                         if (bucket) |b| {
                             const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
 
-                            // Ensure correlate_row is large enough
-                            while (channel.correlate_row.row.items.len <= i) {
-                                try channel.correlate_row.row.append(0);
+                            // Ensure correlate_row is large enough (optimized)
+                            if (channel.correlate_row.row.items.len <= i) {
+                                const old_len = channel.correlate_row.row.items.len;
+                                channel.correlate_row.row.items.len = i + 1;
+                                for (old_len..channel.correlate_row.row.items.len) |idx| {
+                                    channel.correlate_row.row.items[idx] = 0;
+                                }
                             }
                             channel.correlate_row.row.items[i] = golomb_result.rc;
 
@@ -1242,7 +1276,10 @@ pub const QuicEncoder = struct {
                 const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
                 if (bucket) |b| {
                     const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
-                    try channel.correlate_row.row.append(golomb_result.rc);
+                    // Optimized: use direct access since we pre-allocated
+                    const new_len = channel.correlate_row.row.items.len + 1;
+                    channel.correlate_row.row.items.len = new_len;
+                    channel.correlate_row.row.items[new_len - 1] = golomb_result.rc;
                     if (channel.correlate_row.row.items.len == 1) {
                         // This is index 0
                         cur_row[2 - c] = @intCast(getXlatL2u(golomb_result.rc) & 0xFF);
@@ -1290,10 +1327,13 @@ pub const QuicEncoder = struct {
                         const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                         if (bucket) |b| {
                             const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
-                            try channel.correlate_row.row.append(golomb_result.rc);
+                            // Optimized: use direct access since we pre-allocated
+                            const new_len = channel.correlate_row.row.items.len + 1;
+                            channel.correlate_row.row.items.len = new_len;
+                            channel.correlate_row.row.items[new_len - 1] = golomb_result.rc;
 
                             const prev_pixel_idx = (i - 1) * pixel_size;
-                            const color_offset = if (has_padding) (2 - c) else (2 - c);
+                            const color_offset = 2 - c; // Optimized: removed redundant branch
                             const decoded_val = getXlatL2u(golomb_result.rc) + cur_row[prev_pixel_idx + color_offset];
                             cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
 
@@ -1333,10 +1373,13 @@ pub const QuicEncoder = struct {
                     const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                     if (bucket) |b| {
                         const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
-                        try channel.correlate_row.row.append(golomb_result.rc);
+                        // Optimized: use direct access since we pre-allocated
+                        const new_len = channel.correlate_row.row.items.len + 1;
+                        channel.correlate_row.row.items.len = new_len;
+                        channel.correlate_row.row.items[new_len - 1] = golomb_result.rc;
 
                         const prev_pixel_idx = (i - 1) * pixel_size;
-                        const color_offset = if (has_padding) (2 - c) else (2 - c);
+                        const color_offset = 2 - c; // Optimized: removed redundant branch
                         const decoded_val = getXlatL2u(golomb_result.rc) + cur_row[prev_pixel_idx + color_offset];
                         cur_row[pixel_idx + color_offset] = @intCast(decoded_val & bpc_mask);
 
