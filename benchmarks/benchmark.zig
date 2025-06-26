@@ -1,5 +1,5 @@
 const std = @import("std");
-const quic = @import("quic.zig");
+const quic = @import("quic");
 
 const BENCHMARK_ITERATIONS = 100;
 
@@ -15,9 +15,9 @@ pub fn main() !void {
     try quic.init();
 
     // Load test data
-    const test_data = std.fs.cwd().readFileAlloc(allocator, "quic_data.bin", 10 * 1024 * 1024) catch |err| {
-        std.debug.print("❌ Error: Could not load quic_data.bin: {}\n", .{err});
-        std.debug.print("   Make sure you have the test file in the current directory.\n", .{});
+    const test_data = std.fs.cwd().readFileAlloc(allocator, "test_data/quic_image_0.bin", 10 * 1024 * 1024) catch |err| {
+        std.debug.print("❌ Error: Could not load test_data/quic_image_0.bin: {}\n", .{err});
+        std.debug.print("   Make sure you have the test file in the test_data directory.\n", .{});
         return;
     };
     defer allocator.free(test_data);

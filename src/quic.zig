@@ -1,7 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
-const fast_golomb = @import("fast_golomb.zig");
 const Allocator = std.mem.Allocator;
+const packed_pixels = @import("packed_pixels.zig");
+const fast_io = @import("fast_io.zig");
+const golomb_tables = @import("golomb_tables.zig");
 
 // Constants from the original JavaScript
 pub const Constants = struct {
@@ -276,6 +278,16 @@ pub inline fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
     const not_gr_prefix_mask = family_8bpc.not_gr_prefix_mask[l];
 
     if (bits > not_gr_prefix_mask) {
+        // Fast path for common case: zero leading zeros (first bit is 1)
+        if (bits >= 0x80000000) { // First bit is 1, so zero leading zeros
+            const zeroprefix: u32 = 0;
+            const cwlen = zeroprefix + 1 + l; // = 1 + l
+            const shift: u5 = @intCast(@min(32 - cwlen, 31));
+            const rc = (zeroprefix << @intCast(l)) | ((bits >> shift) & BPP_MASK[l]);
+            return GolombResult{ .codewordlen = cwlen, .rc = rc };
+        }
+        
+        // Standard path
         const zeroprefix = cntLZeroes32(bits);
         const cwlen = zeroprefix + 1 + l;
         const rc = (zeroprefix << @intCast(l)) | ((bits >> @intCast(32 - cwlen)) & BPP_MASK[l]);
@@ -287,29 +299,8 @@ pub inline fn golombDecoding8bpc(l: u32, bits: u32) GolombResult {
     }
 }
 
-/// Fast-path: decode first symbol using 12-bit LUT when l == 0.
-const FastOneResult = struct { rc: u32, codewordlen: u32 };
-inline fn fastGolombOne8bpc(bits: u32) ?FastOneResult {
-    // Decode first residual using 12-bit table; returns null if no fast entry
-
-    const entry = fast_golomb.fastGolombBatch(bits);
-    if (entry.count == 0) return null;
-    return FastOneResult{ .rc = entry.rc[0], .codewordlen = entry.bits_used };
-}
-
-/// Unified fast/slow Golomb decode for 8bpc (bestcode 0 uses LUT)
-inline fn golombDec8bpcFast(l: u32, bits: u32) GolombResult {
-    if (l == 0) {
-        if (fastGolombOne8bpc(bits)) |fr| {
-            return GolombResult{ .rc = fr.rc, .codewordlen = fr.codewordlen };
-        }
-    }
-    return golombDecoding8bpc(l, bits);
-}
-
 /// Calculate Golomb code length for 8 bits per component
 pub fn golombCodeLen8bpc(n: u32, l: u32) u32 {
-    // unchanged below
     if (n < family_8bpc.n_gr_codewords[l]) {
         return (n >> @intCast(l)) + 1 + l;
     } else {
@@ -696,6 +687,9 @@ pub const QuicEncoder = struct {
     io_now: []const u8,
     io_end: u32,
     rows_completed: u32,
+    
+    // Fast I/O state (word-based)
+    fast_io_state: ?fast_io.FastIOWord,
 
     pub fn init(allocator: Allocator) !QuicEncoder {
         var encoder = QuicEncoder{
@@ -714,6 +708,7 @@ pub const QuicEncoder = struct {
             .io_now = &[_]u8{},
             .io_end = 0,
             .rows_completed = 0,
+            .fast_io_state = null,
         };
 
         // Initialize channels with null pointers first
@@ -748,24 +743,44 @@ pub const QuicEncoder = struct {
         self.io_end = @intCast(io_ptr.len);
         self.io_idx = 0;
         self.rows_completed = 0;
+        
+        // Initialize fast I/O if buffer is word-aligned and has complete words
+        if (@intFromPtr(io_ptr.ptr) % 4 == 0 and io_ptr.len >= 4 and (io_ptr.len % 4) == 0) {
+            self.fast_io_state = fast_io.FastIOWord.init(io_ptr);
+        } else {
+            self.fast_io_state = null;
+        }
+        
         return true;
     }
 
     /// Read a 32-bit word from the byte stream (little-endian)
     pub inline fn readIoWord(self: *QuicEncoder) !void {
-        if (self.io_idx + 4 > self.io_end) {
-            return error.OutOfData;
-        }
+        if (self.fast_io_state) |*fast_state| {
+            // Fast path: word-based I/O
+            if (fast_state.word_pos >= fast_state.words.len) {
+                return error.OutOfData;
+            }
+            // Read word directly (already in little-endian)
+            self.io_next_word = fast_state.words[fast_state.word_pos];
+            fast_state.word_pos += 1;
+        } else {
+            // Fallback: byte-based I/O
+            if (self.io_idx + 4 > self.io_end) {
+                return error.OutOfData;
+            }
 
-        self.io_next_word = @as(u32, self.io_now[self.io_idx]) |
-            (@as(u32, self.io_now[self.io_idx + 1]) << 8) |
-            (@as(u32, self.io_now[self.io_idx + 2]) << 16) |
-            (@as(u32, self.io_now[self.io_idx + 3]) << 24);
-        self.io_idx += 4;
+            self.io_next_word = @as(u32, self.io_now[self.io_idx]) |
+                (@as(u32, self.io_now[self.io_idx + 1]) << 8) |
+                (@as(u32, self.io_now[self.io_idx + 2]) << 16) |
+                (@as(u32, self.io_now[self.io_idx + 3]) << 24);
+            self.io_idx += 4;
+        }
     }
 
     /// Consume specified number of bits from the bit stream
     pub inline fn decodeEatbits(self: *QuicEncoder, len: u32) !void {
+        // Original byte-based implementation
         self.io_word <<= @intCast(len);
 
         const delta_signed = @as(i32, @intCast(self.io_available_bits)) - @as(i32, @intCast(len));
@@ -813,6 +828,13 @@ pub const QuicEncoder = struct {
         }
 
         self.io_idx = 0;
+        
+        // Initialize I/O state properly whether using fast I/O or not
+        if (self.fast_io_state != null) {
+            // Reset fast I/O state
+            self.fast_io_state = fast_io.FastIOWord.init(io_ptr);
+        }
+        
         try self.readIoWord();
         self.io_word = self.io_next_word;
         self.io_available_bits = 0;
@@ -913,7 +935,7 @@ pub const QuicEncoder = struct {
             while (hits <= temp) : (hits += 1) {
                 runlen += state.melcorder;
 
-                if (state.melcstate < 32) {
+                if (state.melcstate < 31) {  // Changed from 32 to 31 to prevent out of bounds
                     state.melcstate += 1;
                     state.melclen = J[state.melcstate];
                     state.melcorder = @as(u32, 1) << @intCast(state.melclen);
@@ -968,7 +990,7 @@ pub const QuicEncoder = struct {
                 const channel = &self.channels[c];
                 const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
                 if (bucket) |b| {
-                    const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                    const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                     channel.correlate_row.row.items[0] = golomb_result.rc;
 
                     const color_offset = 2 - c; // Optimized: removed redundant branch
@@ -1004,6 +1026,11 @@ pub const QuicEncoder = struct {
 
             // Process pixels until stopidx, checking for RLE conditions
             while (stopidx < end and rc == 0) {
+                // Prefetch next cache line for better performance
+                if (i + 8 < end) {
+                    @prefetch(&prev_row[(i + 8) * pixel_size], .{ .rw = .read, .locality = 3 });
+                    @prefetch(&cur_row[(i + 8) * pixel_size], .{ .rw = .write, .locality = 3 });
+                }
                 var c: u32 = 0;
                 while (i <= stopidx and rc == 0) : (i += 1) {
                     const pixel_idx = i * pixel_size;
@@ -1038,17 +1065,51 @@ pub const QuicEncoder = struct {
 
                         run_end = i + try self.decodeRun(&self.rgb_state);
 
-                        // Copy all color channels for the run
-                        while (i < run_end) : (i += 1) {
-                            const run_pixel_idx = i * pixel_size;
-                            const run_pixelm1_idx = (i - 1) * pixel_size;
-
-                            if (has_padding) {
-                                cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                        // Copy all color channels for the run - optimized with unrolling
+                        const src_idx = (i - 1) * pixel_size;
+                        
+                        if (has_padding and pixel_size == 4) {
+                            // RGB32 - use 32-bit copies for better performance
+                            const src_r = cur_row[src_idx + r_offset];
+                            const src_g = cur_row[src_idx + g_offset];
+                            const src_b = cur_row[src_idx + b_offset];
+                            const src_pixel = (@as(u32, src_r) << 16) | (@as(u32, src_g) << 8) | @as(u32, src_b);
+                            
+                            // Unroll by 8 for better performance
+                            const unroll_count = (run_end - i) / 8;
+                            var j: u32 = 0;
+                            while (j < unroll_count) : (j += 1) {
+                                const base_idx = i + (j * 8);
+                                
+                                // Copy 8 pixels at once using 32-bit stores
+                                inline for (0..8) |k| {
+                                    const dst_idx = (base_idx + k) * 4;
+                                    const dst_ptr = @as(*u32, @ptrCast(@alignCast(&cur_row[dst_idx])));
+                                    dst_ptr.* = src_pixel;
+                                }
                             }
-                            cur_row[run_pixel_idx + r_offset] = cur_row[run_pixelm1_idx + r_offset];
-                            cur_row[run_pixel_idx + g_offset] = cur_row[run_pixelm1_idx + g_offset];
-                            cur_row[run_pixel_idx + b_offset] = cur_row[run_pixelm1_idx + b_offset];
+                            i += unroll_count * 8;
+                            
+                            // Handle remaining pixels
+                            while (i < run_end) : (i += 1) {
+                                const dst_idx = i * 4;
+                                cur_row[dst_idx + 0] = src_b;
+                                cur_row[dst_idx + 1] = src_g;
+                                cur_row[dst_idx + 2] = src_r;
+                                cur_row[dst_idx + 3] = 0;
+                            }
+                        } else {
+                            // RGB24 or fallback - use original approach
+                            while (i < run_end) : (i += 1) {
+                                const run_pixel_idx = i * pixel_size;
+                                
+                                if (has_padding) {
+                                    cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                                }
+                                cur_row[run_pixel_idx + r_offset] = cur_row[src_idx + r_offset];
+                                cur_row[run_pixel_idx + g_offset] = cur_row[src_idx + g_offset];
+                                cur_row[run_pixel_idx + b_offset] = cur_row[src_idx + b_offset];
+                            }
                         }
 
                         if (i == end) {
@@ -1078,7 +1139,7 @@ pub const QuicEncoder = struct {
                             else
                                 null;
                             if (bucket) |b| {
-                                const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                                const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
 
                                 // Ensure correlate_row is large enough (optimized with pre-allocation)
                                 if (channel.correlate_row.row.items.len <= i) {
@@ -1112,12 +1173,8 @@ pub const QuicEncoder = struct {
                 while (c < n_channels) : (c += 1) {
                     const channel = &self.channels[c];
                     if (channel.correlate_row.row.items.len > stopidx) {
-                        const idx_prev = channel.correlate_row.row.items[stopidx - 1];
-                        if (idx_prev < channel.family_stat_8bpc.buckets_ptrs.items.len) {
-                            if (channel.family_stat_8bpc.buckets_ptrs.items[idx_prev]) |b| {
-                                b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
-                            }
-                        }
+                        const b = bucketAt(channel.family_stat_8bpc.buckets_ptrs.items, channel.correlate_row.row.items[stopidx - 1]);
+                        b.updateModel8bpc(&self.rgb_state, channel.correlate_row.row.items[stopidx], bpc);
                     }
                 }
 
@@ -1157,17 +1214,51 @@ pub const QuicEncoder = struct {
 
                     run_end = i + try self.decodeRun(&self.rgb_state);
 
-                    // Copy all color channels for the run
-                    while (i < run_end) : (i += 1) {
-                        const run_pixel_idx = i * pixel_size;
-                        const run_pixelm1_idx = (i - 1) * pixel_size;
-
-                        if (has_padding) {
-                            cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                    // Copy all color channels for the run - optimized with unrolling
+                    const src_idx = (i - 1) * pixel_size;
+                    
+                    if (has_padding and pixel_size == 4) {
+                        // RGB32 - use 32-bit copies for better performance
+                        const src_r = cur_row[src_idx + r_offset];
+                        const src_g = cur_row[src_idx + g_offset];
+                        const src_b = cur_row[src_idx + b_offset];
+                        const src_pixel = (@as(u32, src_r) << 16) | (@as(u32, src_g) << 8) | @as(u32, src_b);
+                        
+                        // Unroll by 8 for better performance
+                        const unroll_count = (run_end - i) / 8;
+                        var j: u32 = 0;
+                        while (j < unroll_count) : (j += 1) {
+                            const base_idx = i + (j * 8);
+                            
+                            // Copy 8 pixels at once using 32-bit stores
+                            inline for (0..8) |k| {
+                                const dst_idx = (base_idx + k) * 4;
+                                const dst_ptr = @as(*u32, @ptrCast(@alignCast(&cur_row[dst_idx])));
+                                dst_ptr.* = src_pixel;
+                            }
                         }
-                        cur_row[run_pixel_idx + r_offset] = cur_row[run_pixelm1_idx + r_offset];
-                        cur_row[run_pixel_idx + g_offset] = cur_row[run_pixelm1_idx + g_offset];
-                        cur_row[run_pixel_idx + b_offset] = cur_row[run_pixelm1_idx + b_offset];
+                        i += unroll_count * 8;
+                        
+                        // Handle remaining pixels
+                        while (i < run_end) : (i += 1) {
+                            const dst_idx = i * 4;
+                            cur_row[dst_idx + 0] = src_b;
+                            cur_row[dst_idx + 1] = src_g;
+                            cur_row[dst_idx + 2] = src_r;
+                            cur_row[dst_idx + 3] = 0;
+                        }
+                    } else {
+                        // RGB24 or fallback - use original approach
+                        while (i < run_end) : (i += 1) {
+                            const run_pixel_idx = i * pixel_size;
+                            
+                            if (has_padding) {
+                                cur_row[run_pixel_idx + RGB32_PIXEL_PAD] = 0;
+                            }
+                            cur_row[run_pixel_idx + r_offset] = cur_row[src_idx + r_offset];
+                            cur_row[run_pixel_idx + g_offset] = cur_row[src_idx + g_offset];
+                            cur_row[run_pixel_idx + b_offset] = cur_row[src_idx + b_offset];
+                        }
                     }
 
                     if (i == end) {
@@ -1193,7 +1284,7 @@ pub const QuicEncoder = struct {
                         const prev_corr_val = channel.correlate_row.row.items[i - 1];
                         const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_corr_val);
                         if (bucket) |b| {
-                            const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                            const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
 
                             // Ensure correlate_row is large enough (optimized)
                             if (channel.correlate_row.row.items.len <= i) {
@@ -1315,7 +1406,7 @@ pub const QuicEncoder = struct {
                 const channel = &self.channels[c];
                 const bucket = channel.family_stat_8bpc.buckets_ptrs.items[channel.correlate_row.zero];
                 if (bucket) |b| {
-                    const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                    const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                     // Optimized: use direct access since we pre-allocated
                     const new_len = channel.correlate_row.row.items.len + 1;
                     channel.correlate_row.row.items.len = new_len;
@@ -1351,6 +1442,11 @@ pub const QuicEncoder = struct {
 
         // Main decompression loop - optimized for hot path
         while (stopidx < end) {
+            // Prefetch next cache line for better performance
+            if (i + 16 < end) {
+                @prefetch(&cur_row[(i + 16) * pixel_size], .{ .rw = .write, .locality = 3 });
+            }
+            
             while (i <= stopidx) : (i += 1) {
                 const pixel_idx = i * pixel_size;
 
@@ -1366,7 +1462,7 @@ pub const QuicEncoder = struct {
                         const prev_val = channel.correlate_row.row.items[i - 1];
                         const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                         if (bucket) |b| {
-                            const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                            const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                             // Optimized: use direct access since we pre-allocated
                             const new_len = channel.correlate_row.row.items.len + 1;
                             channel.correlate_row.row.items.len = new_len;
@@ -1412,7 +1508,7 @@ pub const QuicEncoder = struct {
                     const prev_val = channel.correlate_row.row.items[i - 1];
                     const bucket = getBucket(channel.family_stat_8bpc.buckets_ptrs.items, prev_val);
                     if (bucket) |b| {
-                        const golomb_result = golombDec8bpcFast(b.bestcode, self.io_word);
+                        const golomb_result = golombDecoding8bpc(b.bestcode, self.io_word);
                         // Optimized: use direct access since we pre-allocated
                         const new_len = channel.correlate_row.row.items.len + 1;
                         channel.correlate_row.row.items.len = new_len;

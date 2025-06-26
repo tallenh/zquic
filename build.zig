@@ -52,9 +52,6 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-
     // Integration tests
     const integration_tests = b.addTest(.{
         .root_source_file = b.path("src/integration_test.zig"),
@@ -64,13 +61,17 @@ pub fn build(b: *std.Build) void {
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
+
     const integration_test_step = b.step("test-integration", "Run integration tests against JavaScript reference");
     integration_test_step.dependOn(&run_integration_tests.step);
 
     // Benchmark step (for performance testing)
     const bench_exe = b.addExecutable(.{
         .name = "quic-bench",
-        .root_source_file = b.path("src/bench.zig"),
+        .root_source_file = b.path("benchmarks/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -85,7 +86,7 @@ pub fn build(b: *std.Build) void {
     // Performance benchmark with real SPICE data
     const perf_bench_exe = b.addExecutable(.{
         .name = "quic-benchmark",
-        .root_source_file = b.path("src/benchmark.zig"),
+        .root_source_file = b.path("benchmarks/benchmark.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -97,18 +98,46 @@ pub fn build(b: *std.Build) void {
     const perf_bench_step = b.step("benchmark", "Run performance benchmark with real SPICE data");
     perf_bench_step.dependOn(&run_perf_bench.step);
 
-    // File decoder executable for processing QUIC binary files
-    const decoder_exe = b.addExecutable(.{
-        .name = "quic-decoder",
-        .root_source_file = b.path("src/file_decoder.zig"),
+    // Benchmark executables
+    const zig_bench_exe = b.addExecutable(.{
+        .name = "benchmark_zig",
+        .root_source_file = b.path("benchmarks/benchmark_zig.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
+    });
+    zig_bench_exe.root_module.addImport("quic", quic_lib.root_module);
+
+    // Build C benchmark
+    const build_c_bench = b.addSystemCommand(&.{
+        "gcc", "-O3", "-o", "benchmarks/benchmark_c", 
+        "benchmarks/benchmark_c.c",
+        "-Ispice-common/common",
+        "-Lspice-common/build/common",
+        "-lspice-common-client",
+        "-lspice-common",
+        "-I/opt/homebrew/Cellar/pixman/0.46.0/include/pixman-1",
+        "-L/opt/homebrew/Cellar/pixman/0.46.0/lib",
+        "-lpixman-1",
+        "-I/opt/homebrew/Cellar/glib/2.84.2/include/glib-2.0",
+        "-I/opt/homebrew/Cellar/glib/2.84.2/lib/glib-2.0/include",
+        "-L/opt/homebrew/Cellar/glib/2.84.2/lib",
+        "-lglib-2.0",
     });
 
-    decoder_exe.root_module.addImport("quic", quic_lib.root_module);
-    b.installArtifact(decoder_exe);
+    // Run Zig benchmark
+    const run_zig_bench = b.addRunArtifact(zig_bench_exe);
+    const zig_bench_step = b.step("bench-zig", "Run Zig benchmark");
+    zig_bench_step.dependOn(&run_zig_bench.step);
 
-    const run_decoder = b.addRunArtifact(decoder_exe);
-    const decoder_step = b.step("decode", "Run the QUIC file decoder");
-    decoder_step.dependOn(&run_decoder.step);
+    // Run C benchmark
+    const run_c_bench = b.addSystemCommand(&.{ "./benchmarks/benchmark_c" });
+    run_c_bench.step.dependOn(&build_c_bench.step);
+    const c_bench_step = b.step("bench-c", "Build and run C benchmark");
+    c_bench_step.dependOn(&run_c_bench.step);
+
+    // Run all benchmarks (builds and runs both)
+    const bench_all_step = b.step("bench-all", "Build and run all benchmarks (Zig vs C)");
+    bench_all_step.dependOn(&run_zig_bench.step);
+    bench_all_step.dependOn(&run_c_bench.step);
+
 }

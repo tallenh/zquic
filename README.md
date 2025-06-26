@@ -143,13 +143,29 @@ exe.root_module.addImport("quic", quic_lib.root_module);
 ## Testing
 
 ```bash
-zig build run              # Run all test cases
-zig build test             # Run unit tests
-zig build test-integration # Run integration tests (requires Node.js)
-zig build bench            # Run performance benchmarks
+zig build test              # Run all tests (unit + integration)
+zig build test-integration  # Run integration tests only (requires Node.js)
 ```
 
 The integration test decodes real SPICE data and verifies byte-for-byte compatibility with the JavaScript reference implementation.
+
+## Benchmarking
+
+```bash
+zig build bench-zig   # Run Zig benchmark
+zig build bench-c     # Build and run C benchmark  
+zig build bench-all   # Run both benchmarks for comparison
+zig build benchmark   # Run detailed performance analysis
+```
+
+### Performance Results
+
+Latest benchmark results (2048x1152 RGB32 image):
+- **Zig**: ~1790 MB/s (4.4ms average)
+- **C**: ~615 MB/s (12.9ms average)  
+- **JavaScript**: ~11 MB/s (871ms average)
+
+The optimized Zig implementation is approximately **2.9x faster** than the C implementation.
 
 ## License
 
